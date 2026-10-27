@@ -30,7 +30,7 @@ fn classify(c: char) -> Class {
     }
 }
 
-pub(crate) fn last_line(rope: &Rope) -> usize {
+fn last_line(rope: &Rope) -> usize {
     rope.len_lines() - 1
 }
 
@@ -93,7 +93,7 @@ pub(crate) fn next_col(s: RopeSlice, col: usize) -> usize {
     s.byte_to_char(next_boundary(s, s.char_to_byte(col)))
 }
 
-pub(crate) fn prev_col(s: RopeSlice, col: usize) -> usize {
+fn prev_col(s: RopeSlice, col: usize) -> usize {
     s.byte_to_char(prev_boundary(s, s.char_to_byte(col)))
 }
 
