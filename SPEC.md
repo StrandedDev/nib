@@ -86,7 +86,7 @@ so Ctrl+S / Ctrl+Q reach nib.
 - **Tab:** inserts spaces. Width detected from the file, else 4 (2 for `.json`). Files indented with tabs, and any `Makefile`, keep real tabs.
 - **Syntax highlighting:** small hand-written highlighters for Markdown and JSON only.
 - **Command palette:** lists every action with its current key; fuzzy search; driven by the same command registry as the keymap.
-- **Clipboard:** system clipboard when a display exists (`DISPLAY`/`WAYLAND_DISPLAY` set, or Windows); otherwise OSC 52 (SSH, headless, TTY).
+- **Clipboard:** system clipboard when a display exists (`DISPLAY`/`WAYLAND_DISPLAY` set, or Windows); otherwise OSC 52 (SSH, headless, TTY). Copy with no selection does nothing and says `Nothing selected`. OSC 52 payloads over 100 KB of base64 are not sent (status `Copied (too large for terminal clipboard)`); the copy stays inside nib.
 - **Rendering:** draw only the visible region; stays fast on very long lines and terminal resizes.
 - **Unicode:** cursor and wrapping respect grapheme clusters and display width (CJK, emoji).
 

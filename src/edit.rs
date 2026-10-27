@@ -31,6 +31,51 @@ impl Editor {
         (a != c).then(|| a.min(c)..a.max(c))
     }
 
+    /// The chars a line cut removes: the cursor line with its newline. The
+    /// last line has none, so it takes the preceding newline instead.
+    pub fn cut_line_range(&self) -> Range<usize> {
+        let rope = &self.buf.rope;
+        let line = self.cursor.line.min(rope.len_lines() - 1);
+        let start = rope.line_to_char(line);
+        if line + 1 < rope.len_lines() {
+            start..rope.line_to_char(line + 1)
+        } else {
+            start.saturating_sub(1)..rope.len_chars()
+        }
+    }
+
+    pub fn selected_text(&self) -> Option<String> {
+        Some(self.buf.rope.slice(self.selection()?).to_string())
+    }
+
+    /// Removes and returns the selection, or the cursor line when there is
+    /// none (always ending in `\n`). One mutation.
+    pub fn cut(&mut self) -> String {
+        if let Some(text) = self.selected_text() {
+            self.delete_selection();
+            return text;
+        }
+        let range = self.cut_line_range();
+        let mut text = self.buf.rope.slice(range.clone()).to_string();
+        let line = self.cursor.line;
+        self.replace_range(range, "");
+        if text.starts_with('\n') {
+            text.remove(0);
+        }
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        let last = self.buf.rope.len_lines() - 1;
+        self.move_to(
+            Pos {
+                line: line.min(last),
+                col: 0,
+            },
+            false,
+        );
+        text
+    }
+
     pub fn select_all(&mut self) {
         self.move_to(cursor::file_start(&self.buf.rope), false);
         self.move_to(cursor::file_end(&self.buf.rope), true);
@@ -385,5 +430,44 @@ cd");
         e.move_to(pos(0, 1), true);
         e.collapse(true);
         assert_eq!((e.cursor, e.anchor), (pos(0, 1), None));
+    }
+
+    #[test]
+    fn cut_line_range_middle_line_includes_newline() {
+        let mut e = ed("ab\ncd\nef");
+        e.move_to(pos(1, 1), false);
+        assert_eq!(e.cut_line_range(), 3..6);
+    }
+
+    #[test]
+    fn cut_last_line_takes_preceding_newline() {
+        let mut e = ed("ab\ncd\nef");
+        e.move_to(pos(2, 1), false);
+        assert_eq!(e.cut(), "ef\n");
+        assert_eq!(text(&e), "ab\ncd");
+        assert_eq!(e.cursor, pos(1, 0));
+    }
+
+    #[test]
+    fn cut_only_line_leaves_empty_buffer() {
+        let mut e = ed("abc");
+        assert_eq!(e.cut(), "abc\n");
+        assert_eq!(text(&e), "");
+        assert_eq!(e.cursor, pos(0, 0));
+    }
+
+    #[test]
+    fn cut_middle_line_and_selection() {
+        let mut e = ed("ab\ncd\nef");
+        e.move_to(pos(1, 1), false);
+        assert_eq!(e.cut(), "cd\n");
+        assert_eq!(text(&e), "ab\nef");
+        assert_eq!(e.cursor, pos(1, 0));
+        assert_eq!(e.buf.version, 1);
+        e.move_to(pos(0, 0), false);
+        e.move_to(pos(1, 1), true);
+        assert_eq!(e.cut(), "ab\ne");
+        assert_eq!(text(&e), "f");
+        assert_eq!(e.buf.version, 2);
     }
 }

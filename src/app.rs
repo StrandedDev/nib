@@ -11,6 +11,7 @@ use crossterm::terminal;
 
 use crate::buffer::{Buffer, LineEnding};
 use crate::cli;
+use crate::clipboard::{Clip, Osc52};
 use crate::commands::CommandId;
 use crate::cursor::{self, Pos};
 use crate::edit::Editor;
@@ -36,6 +37,7 @@ pub struct App {
     status: Option<(String, Instant)>,
     /// Time and cell of the last left-button press, for double-click.
     last_click: Option<(Instant, u16, u16)>,
+    clip: Box<dyn Clip>,
     quit: bool,
 }
 
@@ -82,6 +84,11 @@ impl App {
         Ok(app)
     }
 
+    pub fn with_clipboard(mut self, clip: Box<dyn Clip>) -> App {
+        self.clip = clip;
+        self
+    }
+
     /// The terminal loop. The only place that takes over the terminal; the
     /// guard restores it on every return.
     pub fn run(&mut self) -> Result<()> {
@@ -93,6 +100,11 @@ impl App {
         while !self.quit {
             if redraw {
                 render::draw(&mut out, &self.view())?;
+                // After the frame, so it cannot land in the middle of one.
+                if let Some(seq) = self.clip.take_pending() {
+                    out.write_all(seq.as_bytes())?;
+                    out.flush()?;
+                }
             }
             let mut changed = false;
             if event::poll(POLL)? {
@@ -170,10 +182,39 @@ impl App {
             C::Newline => self.editor.newline(),
             C::Tab => self.editor.insert_str(&" ".repeat(usize::from(TAB_WIDTH))),
             C::Quit => self.quit(),
+            C::Copy => self.copy(),
+            C::Cut => self.cut(),
+            C::Paste => self.paste(),
             C::Save => {
                 self.save(false);
             }
             _ => self.set_status("Not available yet"),
+        }
+    }
+
+    fn copy(&mut self) {
+        match self.editor.selected_text() {
+            Some(text) => self.clip_set(&text),
+            None => self.set_status("Nothing selected"),
+        }
+    }
+
+    fn cut(&mut self) {
+        let text = self.editor.cut();
+        self.clip_set(&text);
+    }
+
+    // Many terminals intercept Ctrl+V and send a bracketed paste instead.
+    fn paste(&mut self) {
+        if let Some(text) = self.clip.get() {
+            self.editor.insert_str(&text); // normalises CRLF
+        }
+    }
+
+    fn clip_set(&mut self, text: &str) {
+        self.clip.set(text);
+        if let Some(msg) = self.clip.take_notice() {
+            self.set_status(msg);
         }
     }
 
@@ -420,6 +461,7 @@ impl App {
             prompt: None,
             status: None,
             last_click: None,
+            clip: Box::new(Osc52::default()),
             quit: false,
         }
     }
@@ -1089,5 +1131,92 @@ mod tests {
         assert_eq!(cursor_cell(&app), None);
         typ(&mut app, "x");
         assert!(cursor_cell(&app).is_some());
+    }
+
+    use crate::clipboard::Clip;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    #[derive(Clone, Default)]
+    struct FakeClip(Rc<RefCell<Option<String>>>);
+
+    impl Clip for FakeClip {
+        fn get(&mut self) -> Option<String> {
+            self.0.borrow().clone()
+        }
+        fn set(&mut self, s: &str) {
+            *self.0.borrow_mut() = Some(s.to_string());
+        }
+    }
+
+    fn clip_app(text: &str) -> (App, FakeClip) {
+        let fake = FakeClip::default();
+        let app = App::from_buffer(Buffer::from_str_detect(text), None)
+            .with_clipboard(Box::new(fake.clone()));
+        (app, fake)
+    }
+
+    #[test]
+    fn copy_selection() {
+        let (mut app, fake) = clip_app("hello world");
+        app.editor.move_to(Pos { line: 0, col: 6 }, true);
+        app.dispatch(CommandId::Copy);
+        assert_eq!(fake.0.borrow().as_deref(), Some("hello "));
+        assert_eq!(app.editor.buf.rope.to_string(), "hello world");
+        assert_eq!(app.status_text(), None);
+    }
+
+    #[test]
+    fn copy_without_selection_is_noop_with_status() {
+        let (mut app, fake) = clip_app("abc");
+        app.dispatch(CommandId::Copy);
+        assert_eq!(status(&app), "Nothing selected");
+        assert_eq!(*fake.0.borrow(), None);
+        assert!(!app.editor.buf.dirty);
+    }
+
+    #[test]
+    fn cut_line_without_selection() {
+        let (mut app, fake) = clip_app("ab\ncd\n");
+        app.dispatch(CommandId::Cut);
+        assert_eq!(fake.0.borrow().as_deref(), Some("ab\n"));
+        assert_eq!(app.editor.buf.rope.to_string(), "cd");
+        assert_eq!(app.status_text(), None);
+    }
+
+    #[test]
+    fn paste_inserts_text() {
+        let (mut app, fake) = clip_app("ad");
+        *fake.0.borrow_mut() = Some("b\r\nc".into());
+        app.editor.move_to(Pos { line: 0, col: 1 }, false);
+        app.handle_event(key(KeyCode::Char('v'), KeyModifiers::CONTROL));
+        assert_eq!(app.editor.buf.rope.to_string(), "ab\ncd");
+    }
+
+    #[test]
+    fn paste_replaces_selection() {
+        let (mut app, fake) = clip_app("hello world");
+        *fake.0.borrow_mut() = Some("X".into());
+        app.editor.move_to(Pos { line: 0, col: 5 }, true);
+        app.dispatch(CommandId::Paste);
+        assert_eq!(app.editor.buf.rope.to_string(), "X world");
+    }
+
+    #[test]
+    fn paste_empty_clipboard_not_dirty() {
+        let (mut app, fake) = clip_app("abc");
+        app.dispatch(CommandId::Paste);
+        *fake.0.borrow_mut() = Some(String::new());
+        app.dispatch(CommandId::Paste);
+        assert!(!app.editor.buf.dirty);
+        assert_eq!(app.editor.buf.rope.to_string(), "abc");
+    }
+
+    #[test]
+    fn copy_too_large_for_osc52_shows_status() {
+        let mut app = App::from_buffer(Buffer::from_str_detect(&"a".repeat(80_000)), None);
+        app.editor.select_all();
+        app.dispatch(CommandId::Copy);
+        assert_eq!(status(&app), crate::clipboard::TOO_LARGE);
     }
 }
