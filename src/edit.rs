@@ -1,15 +1,19 @@
 //! Text mutations over a buffer and cursor.
 
 use std::ops::Range;
+use std::time::Instant;
 
 use crate::buffer::Buffer;
 use crate::cursor::{self, Pos};
+use crate::undo::{Edit, EditKind, UndoStack};
 
 pub struct Editor {
     pub buf: Buffer,
     pub cursor: Pos,
     pub anchor: Option<Pos>,
     pub preferred_col: Option<usize>,
+    undo: UndoStack,
+    now: Option<Instant>,
 }
 
 impl Editor {
@@ -19,6 +23,36 @@ impl Editor {
             cursor: Pos::default(),
             anchor: None,
             preferred_col: None,
+            undo: UndoStack::new(),
+            now: None,
+        }
+    }
+
+    /// Pins the clock used for undo grouping; `None` uses the real one.
+    #[cfg(test)]
+    pub(crate) fn set_now(&mut self, now: Option<Instant>) {
+        self.now = now;
+    }
+
+    pub fn mark_saved(&mut self) {
+        self.undo.mark_saved();
+    }
+
+    pub fn undo(&mut self) {
+        let pos = self.undo.undo(&mut self.buf);
+        self.settle(pos);
+    }
+
+    pub fn redo(&mut self) {
+        let pos = self.undo.redo(&mut self.buf);
+        self.settle(pos);
+    }
+
+    fn settle(&mut self, pos: Option<Pos>) {
+        if let Some(p) = pos {
+            self.cursor = cursor::clamp(&self.buf.rope, p);
+            self.anchor = None;
+            self.preferred_col = None;
         }
     }
 
@@ -58,7 +92,7 @@ impl Editor {
         let range = self.cut_line_range();
         let mut text = self.buf.rope.slice(range.clone()).to_string();
         let line = self.cursor.line;
-        self.replace_range(range, "");
+        self.replace_range(range, "", EditKind::Other);
         if text.starts_with('\n') {
             text.remove(0);
         }
@@ -97,7 +131,16 @@ impl Editor {
         self.move_to(end, true);
     }
 
+    /// Keyboard text input; consecutive typing groups into one undo step.
+    pub fn type_text(&mut self, s: &str) {
+        self.insert(s, EditKind::Typing);
+    }
+
     pub fn insert_str(&mut self, s: &str) {
+        self.insert(s, EditKind::Other);
+    }
+
+    fn insert(&mut self, s: &str, kind: EditKind) {
         if s.is_empty() {
             return;
         }
@@ -106,7 +149,7 @@ impl Editor {
             let at = cursor::to_char_idx(&self.buf.rope, self.cursor);
             at..at
         });
-        self.replace_range(range, &s);
+        self.replace_range(range, &s, kind);
     }
 
     pub fn backspace(&mut self) {
@@ -114,7 +157,7 @@ impl Editor {
             return;
         }
         let start = cursor::left(&self.buf.rope, self.cursor);
-        self.delete_range(start, self.cursor);
+        self.delete_range(start, self.cursor, EditKind::Deleting);
     }
 
     pub fn delete(&mut self) {
@@ -122,7 +165,7 @@ impl Editor {
             return;
         }
         let end = cursor::right(&self.buf.rope, self.cursor);
-        self.delete_range(self.cursor, end);
+        self.delete_range(self.cursor, end, EditKind::Deleting);
     }
 
     pub fn newline(&mut self) {
@@ -134,7 +177,7 @@ impl Editor {
             return;
         }
         let start = cursor::word_left(&self.buf.rope, self.cursor);
-        self.delete_range(start, self.cursor);
+        self.delete_range(start, self.cursor, EditKind::Other);
     }
 
     pub fn delete_word_fwd(&mut self) {
@@ -142,7 +185,7 @@ impl Editor {
             return;
         }
         let end = cursor::word_right(&self.buf.rope, self.cursor);
-        self.delete_range(self.cursor, end);
+        self.delete_range(self.cursor, end, EditKind::Other);
     }
 
     pub fn move_to(&mut self, pos: Pos, select: bool) {
@@ -160,7 +203,7 @@ impl Editor {
     fn delete_selection(&mut self) -> bool {
         match self.selection() {
             Some(r) => {
-                self.replace_range(r, "");
+                self.replace_range(r, "", EditKind::Other);
                 true
             }
             None => false,
@@ -168,19 +211,22 @@ impl Editor {
     }
 
     /// Removes `[start, end)` and puts the cursor at `start`; empty ranges are no-ops.
-    fn delete_range(&mut self, start: Pos, end: Pos) {
+    fn delete_range(&mut self, start: Pos, end: Pos, kind: EditKind) {
         let a = cursor::to_char_idx(&self.buf.rope, start);
         let b = cursor::to_char_idx(&self.buf.rope, end);
-        self.replace_range(a..b, "");
+        self.replace_range(a..b, "", kind);
     }
 
     /// The one mutation path: replaces chars `range` with `s`, leaves the
-    /// cursor after `s`, and drops the anchor. Empty-for-empty is a no-op.
-    fn replace_range(&mut self, range: Range<usize>, s: &str) {
+    /// cursor after `s`, drops the anchor, and records the change for undo.
+    /// Empty-for-empty is a no-op.
+    fn replace_range(&mut self, range: Range<usize>, s: &str, kind: EditKind) {
         if range.start >= range.end && s.is_empty() {
             return;
         }
         let at = range.start;
+        let cursor_before = self.cursor;
+        let removed = self.buf.rope.slice(range.clone()).to_string();
         if range.start < range.end {
             self.buf.rope.remove(range);
         }
@@ -190,6 +236,15 @@ impl Editor {
         self.cursor = cursor::from_char_idx(&self.buf.rope, at + s.chars().count());
         self.anchor = None;
         self.preferred_col = None;
+        let edit = Edit {
+            at,
+            removed,
+            inserted: s.to_string(),
+            cursor_before,
+            cursor_after: self.cursor,
+        };
+        let now = self.now.unwrap_or_else(Instant::now);
+        self.undo.push(edit, kind, now);
     }
 }
 
@@ -469,5 +524,112 @@ cd");
         assert_eq!(e.cut(), "ab\ne");
         assert_eq!(text(&e), "f");
         assert_eq!(e.buf.version, 2);
+    }
+
+    #[test]
+    fn undo_restores_selection_replaced_text() {
+        let mut e = ed("abc");
+        e.move_to(pos(0, 0), false);
+        e.move_to(pos(0, 3), true);
+        e.type_text("x");
+        assert_eq!(text(&e), "x");
+        e.undo();
+        assert_eq!(text(&e), "abc");
+        assert_eq!((e.cursor, e.anchor), (pos(0, 3), None));
+        e.redo();
+        assert_eq!(text(&e), "x");
+        assert_eq!(e.cursor, pos(0, 1));
+    }
+
+    #[test]
+    fn consecutive_backspaces_merge() {
+        let mut e = ed("abcdef");
+        e.set_now(Some(Instant::now()));
+        e.move_to(pos(0, 6), false);
+        for _ in 0..3 {
+            e.backspace();
+        }
+        assert_eq!(text(&e), "abc");
+        e.undo();
+        assert_eq!(text(&e), "abcdef");
+        assert_eq!(e.cursor, pos(0, 6));
+    }
+
+    #[test]
+    fn typing_and_backspace_do_not_merge() {
+        let mut e = ed("");
+        e.set_now(Some(Instant::now()));
+        e.type_text("a");
+        e.type_text("b");
+        e.backspace();
+        e.undo();
+        assert_eq!(text(&e), "ab");
+        e.undo();
+        assert_eq!(text(&e), "");
+    }
+
+    #[test]
+    fn cut_is_one_step() {
+        let mut e = ed("ab
+cd
+ef");
+        e.move_to(pos(1, 1), false);
+        e.cut();
+        e.undo();
+        assert_eq!(
+            text(&e),
+            "ab
+cd
+ef"
+        );
+        assert_eq!(e.cursor, pos(1, 1));
+        e.insert_str(
+            "1
+2",
+        );
+        e.undo();
+        assert_eq!(
+            text(&e),
+            "ab
+cd
+ef"
+        );
+    }
+
+    #[test]
+    fn undo_bumps_version() {
+        let mut e = ed("");
+        e.set_now(Some(Instant::now()));
+        e.type_text("a");
+        e.type_text("b");
+        assert_eq!(e.buf.version, 2);
+        e.undo();
+        assert_eq!(e.buf.version, 3);
+        e.redo();
+        assert_eq!(e.buf.version, 4);
+    }
+
+    #[test]
+    fn undo_empty_is_noop() {
+        let mut e = ed("ab");
+        e.move_to(pos(0, 1), false);
+        e.undo();
+        e.redo();
+        assert_eq!(
+            (e.buf.version, e.buf.dirty, e.cursor),
+            (0, false, pos(0, 1))
+        );
+        assert_eq!(text(&e), "ab");
+    }
+
+    #[test]
+    fn undo_resets_preferred_col_and_anchor() {
+        let mut e = ed("abc");
+        e.type_text("x");
+        e.preferred_col = Some(4);
+        e.move_to(pos(0, 0), true);
+        e.preferred_col = Some(4);
+        e.undo();
+        assert_eq!((e.anchor, e.preferred_col), (None, None));
     }
 }

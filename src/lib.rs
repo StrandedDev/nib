@@ -11,3 +11,4 @@ pub mod layout;
 pub mod prompt;
 pub mod render;
 pub mod terminal;
+pub mod undo;

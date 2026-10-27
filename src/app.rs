@@ -181,6 +181,15 @@ impl App {
             C::DeleteWordFwd => self.editor.delete_word_fwd(),
             C::Newline => self.editor.newline(),
             C::Tab => self.editor.insert_str(&" ".repeat(usize::from(TAB_WIDTH))),
+            C::Undo | C::Redo => {
+                if id == C::Undo {
+                    self.editor.undo();
+                } else {
+                    self.editor.redo();
+                }
+                // Text left of a no-wrap anchor may have changed under the cursor.
+                self.viewport.invalidate();
+            }
             C::Quit => self.quit(),
             C::Copy => self.copy(),
             C::Cut => self.cut(),
@@ -258,6 +267,7 @@ impl App {
             return false;
         }
         self.editor.buf.dirty = false;
+        self.editor.mark_saved();
         self.disk_mtime = fileio::mtime(&path);
         if self.is_new {
             self.read_only = !fileio::is_writable(&path);
@@ -369,7 +379,7 @@ impl App {
                     self.dispatch(id);
                 } else if let Some(c) = typed_char(&key) {
                     let mut b = [0; 4];
-                    self.editor.insert_str(c.encode_utf8(&mut b));
+                    self.editor.type_text(c.encode_utf8(&mut b));
                 }
             }
             Event::Resize(w, h) => {
@@ -1218,5 +1228,65 @@ mod tests {
         app.editor.select_all();
         app.dispatch(CommandId::Copy);
         assert_eq!(status(&app), crate::clipboard::TOO_LARGE);
+    }
+
+    #[test]
+    fn ctrl_z_and_ctrl_y_undo_and_redo_typed_text() {
+        let d = tempdir().unwrap();
+        let (_, mut app) = existing(
+            &d, "abc
+",
+        );
+        typ(&mut app, "xy");
+        let ctrl = KeyModifiers::CONTROL;
+        app.handle_event(key(KeyCode::Char('z'), ctrl));
+        assert_eq!(app.editor.buf.rope.to_string(), "abc");
+        assert!(!app.editor.buf.dirty);
+        app.handle_event(key(KeyCode::Char('y'), ctrl));
+        assert_eq!(app.editor.buf.rope.to_string(), "xyabc");
+        assert!(app.editor.buf.dirty);
+    }
+
+    #[test]
+    fn save_marks_undo_save_point() {
+        let d = tempdir().unwrap();
+        let (_, mut app) = existing(
+            &d, "abc
+",
+        );
+        typ(&mut app, "x");
+        app.dispatch(CommandId::Save);
+        app.dispatch(CommandId::Undo);
+        assert!(app.editor.buf.dirty);
+        app.dispatch(CommandId::Redo);
+        assert!(!app.editor.buf.dirty);
+    }
+
+    #[test]
+    fn paste_is_one_undo_step() {
+        let d = tempdir().unwrap();
+        let (_, mut app) = existing(
+            &d, "abc
+",
+        );
+        app.handle_event(Event::Paste(
+            "one two
+three"
+                .into(),
+        ));
+        app.dispatch(CommandId::Undo);
+        assert_eq!(app.editor.buf.rope.to_string(), "abc");
+    }
+
+    #[test]
+    fn undo_restores_cursor() {
+        let d = tempdir().unwrap();
+        let (_, mut app) = existing(
+            &d, "abc
+",
+        );
+        typ(&mut app, "x");
+        app.dispatch(CommandId::Undo);
+        assert_eq!(app.editor.cursor, pos(0, 0));
     }
 }
