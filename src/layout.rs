@@ -259,10 +259,23 @@ pub struct Viewport {
     pub hscroll_col: usize,
     pub hscroll_line: usize,
     pub tab_width: u8,
+    /// (buffer version, tab width) the anchor was computed under.
+    hscroll_key: Option<(u64, u8)>,
     wrap_cache: Option<WrapCache>,
 }
 
 impl Viewport {
+    /// Drops the row cache and the no-wrap anchor. Call when the buffer is
+    /// replaced (open, reload): `Buffer::version` restarts at 0 then, so the
+    /// version keys alone cannot tell old state from new.
+    pub fn invalidate(&mut self) {
+        self.wrap_cache = None;
+        self.hscroll = 0;
+        self.hscroll_col = 0;
+        self.hscroll_line = 0;
+        self.hscroll_key = None;
+    }
+
     pub fn new(width: u16, height: u16, wrap: bool, tab_width: u8) -> Viewport {
         Viewport {
             top: Row::default(),
@@ -273,6 +286,7 @@ impl Viewport {
             hscroll_col: 0,
             hscroll_line: 0,
             tab_width,
+            hscroll_key: None,
             wrap_cache: None,
         }
     }
@@ -361,6 +375,25 @@ fn row_holds(rope: &Rope, vp: &Viewport, row: &Row, cur: Pos) -> bool {
             || (cur.col == row.end_col
                 && row.end_col == s.len_chars()
                 && !ends_full(s, row, vp.width, vp.tab_width, vp.wrap)))
+}
+
+/// First grapheme boundary of the line at display x >= `target` (or the line
+/// end), as (col, x). Bulk-skips ASCII so one walk over a huge line is cheap.
+fn boundary_at_or_after(s: RopeSlice, target: usize, tab: u8) -> (usize, usize) {
+    let len = s.len_chars();
+    let (mut col, mut x) = (0, 0);
+    while col < len && x < target {
+        if let Some(n) = ascii_run(s, col) {
+            let k = n.min(target - x);
+            col += k;
+            x += k;
+        } else {
+            let c = Cells::at(s, col, x, tab).next().expect("col < len");
+            col = c.end;
+            x += c.w;
+        }
+    }
+    (col, x)
 }
 
 /// Display x of char column `col`, counted from the start of the row that
@@ -610,9 +643,10 @@ pub fn scroll_to_cursor(rope: &Rope, vp: &mut Viewport, cur: Pos, version: u64) 
     let cur = clamp(rope, cur);
     let height = usize::from(vp.height).max(1);
     if !vp.wrap {
-        scroll_nowrap(rope, vp, cur, height);
+        scroll_nowrap(rope, vp, cur, height, version);
         return;
     }
+    vp.hscroll_key = None; // wrap mode edits are invisible to the anchor
     let mut ahead = RowIter::new(rope, vp, vp.top.line, vp.top.start_col);
     for _ in 0..height {
         match ahead.next() {
@@ -639,7 +673,7 @@ pub fn scroll_to_cursor(rope: &Rope, vp: &mut Viewport, cur: Pos, version: u64) 
     vp.top = c.row(c.index_of(cur.col), len);
 }
 
-fn scroll_nowrap(rope: &Rope, vp: &mut Viewport, cur: Pos, height: usize) {
+fn scroll_nowrap(rope: &Rope, vp: &mut Viewport, cur: Pos, height: usize, version: u64) {
     let top = vp.top.line.min(rope.len_lines() - 1);
     let top = if cur.line < top {
         cur.line
@@ -652,12 +686,20 @@ fn scroll_nowrap(rope: &Rope, vp: &mut Viewport, cur: Pos, height: usize) {
     let s = line_text(rope, cur.line);
     let len = s.len_chars();
     let tab = vp.tab_width;
-    if vp.hscroll_line != cur.line || vp.hscroll_col > len {
-        // New line: keep the display offset, found once from the line start.
-        let (col, x) = Cells::new(s, 0, tab)
-            .find(|c| c.x >= vp.hscroll)
-            .map_or_else(|| (len, x_at(s, 0, len, tab)), |c| (c.start, c.x));
+    let key = Some((version, tab));
+    let same_line = vp.hscroll_line == cur.line && vp.hscroll_col <= len;
+    if same_line && vp.hscroll_key != key {
+        // An edit at or right of the anchor leaves it valid; a tab width
+        // change or an edit possibly before it does not.
+        let edit_right = vp.hscroll_key.is_some_and(|(_, t)| t == tab) && cur.col > vp.hscroll_col;
+        vp.hscroll_key = if edit_right { key } else { None };
+    }
+    if !same_line || vp.hscroll_key.is_none() {
+        // Re-anchor at the same display offset, found from the line start:
+        // the first grapheme boundary at or after it.
+        let (col, x) = boundary_at_or_after(s, vp.hscroll, tab);
         (vp.hscroll_line, vp.hscroll_col, vp.hscroll) = (cur.line, col, x);
+        vp.hscroll_key = key;
     }
     let x = abs_x(s, vp, cur.line, cur.col);
     let width = usize::from(vp.width).max(1);
@@ -1076,5 +1118,65 @@ mod tests {
         scroll_to_cursor(&r, &mut v, pos(0, 1), 1);
         scroll_to_cursor(&r, &mut v, pos(0, 36), 1);
         assert_eq!(v.top, row(0, 35, 39));
+    }
+
+    #[test]
+    fn nowrap_anchor_survives_backspace_before_it() {
+        let mut r = Rope::from_str("xxxxxx\u{4f60}abcdefghijklmnop\n0123456789abcdefghijklmnop");
+        let mut v = vp(4, 5, false);
+        scroll_to_cursor(&r, &mut v, pos(0, 10), 0);
+        assert_eq!((v.hscroll, v.hscroll_col), (8, 7));
+        r.remove(6..7);
+        scroll_to_cursor(&r, &mut v, pos(0, 6), 1);
+        let s = line_text(&r, 0);
+        let scratch = x_at(s, 0, 6, 4);
+        assert_eq!(scratch, 6);
+        assert_eq!(
+            usize::from(cursor_screen(&r, &v, pos(0, 6)).0),
+            scratch - v.hscroll
+        );
+        // The anchor line and another line agree on x for the same column.
+        let at0 = screen_to_pos(&r, &v, 1, 0);
+        let at1 = screen_to_pos(&r, &v, 1, 1);
+        assert_eq!((at0.col, at1.col), (7, 7));
+    }
+
+    #[test]
+    fn nowrap_anchor_reset_on_tab_width_change() {
+        let r = Rope::from_str("\tabcdefghijklmnop");
+        let mut v = vp(4, 5, false);
+        scroll_to_cursor(&r, &mut v, pos(0, 9), 0);
+        v.tab_width = 8;
+        scroll_to_cursor(&r, &mut v, pos(0, 9), 0);
+        let scratch = x_at(line_text(&r, 0), 0, 9, 8);
+        assert_eq!(
+            usize::from(cursor_screen(&r, &v, pos(0, 9)).0),
+            scratch - v.hscroll
+        );
+    }
+
+    #[test]
+    fn nowrap_edit_right_of_anchor_keeps_anchor() {
+        let mut r = Rope::from_str("abcdefghijkl");
+        let mut v = vp(4, 5, false);
+        scroll_to_cursor(&r, &mut v, pos(0, 10), 0);
+        let anchor = (v.hscroll, v.hscroll_col);
+        r.insert(10, "z");
+        scroll_to_cursor(&r, &mut v, pos(0, 11), 1);
+        assert!(v.hscroll_col >= anchor.1);
+        assert_eq!(cursor_screen(&r, &v, pos(0, 11)).0, 3);
+    }
+
+    #[test]
+    fn invalidate_clears_caches() {
+        let r = Rope::from_str(&"a".repeat(40));
+        let mut v = vp(4, 1, true);
+        scroll_to_cursor(&r, &mut v, pos(0, 36), 0);
+        assert!(v.wrap_cache.is_some());
+        v.hscroll = 5;
+        v.hscroll_col = 5;
+        v.invalidate();
+        assert!(v.wrap_cache.is_none());
+        assert_eq!((v.hscroll, v.hscroll_col, v.hscroll_line), (0, 0, 0));
     }
 }
