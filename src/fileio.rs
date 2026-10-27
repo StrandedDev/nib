@@ -6,6 +6,8 @@ use std::time::SystemTime;
 use crate::buffer::Buffer;
 
 pub const LARGE_FILE_BYTES: u64 = 50 * 1024 * 1024;
+const MAX_LINK_HOPS: usize = 40;
+const MAX_TEMP_RETRIES: u32 = 99;
 const BINARY_SNIFF_BYTES: usize = 8192;
 
 pub enum Loaded {
@@ -38,27 +40,70 @@ pub fn load(path: &Path, allow_large: bool) -> io::Result<Loaded> {
     }
 }
 
+fn resolve_target(path: &Path) -> io::Result<PathBuf> {
+    let mut cur = path.to_path_buf();
+    for _ in 0..=MAX_LINK_HOPS {
+        match fs::symlink_metadata(&cur) {
+            Ok(m) if m.file_type().is_symlink() => {
+                let link = fs::read_link(&cur)?;
+                cur = cur.parent().unwrap_or(Path::new("")).join(link);
+            }
+            _ => return Ok(cur),
+        }
+    }
+    Err(io::Error::other("too many levels of symbolic links"))
+}
+
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let target = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let target = resolve_target(path)?;
     let name = target
         .file_name()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
     let dir = target.parent().unwrap_or(Path::new("."));
-    let mut tmp_name = std::ffi::OsString::from(".");
-    tmp_name.push(name);
-    tmp_name.push(format!(".nib-{}.tmp", std::process::id()));
-    let tmp = dir.join(tmp_name);
+    let pid = std::process::id();
 
-    let result = write_and_rename(&tmp, &target, dir, bytes);
+    // Only a temp file this call created is ever removed.
+    let mut created = None;
+    for n in 0..=MAX_TEMP_RETRIES {
+        let mut tmp_name = std::ffi::OsString::from(".");
+        tmp_name.push(name);
+        if n == 0 {
+            tmp_name.push(format!(".nib-{pid}.tmp"));
+        } else {
+            tmp_name.push(format!(".nib-{pid}-{n}.tmp"));
+        }
+        let tmp = dir.join(tmp_name);
+        match OpenOptions::new().write(true).create_new(true).open(&tmp) {
+            Ok(f) => {
+                created = Some((tmp, f));
+                break;
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    let Some((tmp, f)) = created else {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not find a free temp file name",
+        ));
+    };
+
+    let result = write_and_rename(f, &tmp, &target, dir, bytes);
     if result.is_err() {
         let _ = fs::remove_file(&tmp);
     }
     result
 }
 
-fn write_and_rename(tmp: &Path, target: &Path, dir: &Path, bytes: &[u8]) -> io::Result<()> {
+fn write_and_rename(
+    mut f: fs::File,
+    tmp: &Path,
+    target: &Path,
+    dir: &Path,
+    bytes: &[u8],
+) -> io::Result<()> {
     let original = fs::metadata(target).ok();
-    let mut f = OpenOptions::new().write(true).create_new(true).open(tmp)?;
     f.write_all(bytes)?;
     f.sync_all()?;
     drop(f);
@@ -232,6 +277,48 @@ mod tests {
                 .is_symlink()
         );
         assert_eq!(fs::read(&real).unwrap(), b"new");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_dangling_symlink_creates_target() {
+        let d = tempdir().unwrap();
+        let real = d.path().join("real.txt");
+        let link = d.path().join("link.txt");
+        std::os::unix::fs::symlink("real.txt", &link).unwrap();
+        atomic_write(&link, b"new").unwrap();
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read(&real).unwrap(), b"new");
+    }
+
+    #[test]
+    fn existing_temp_name_is_not_deleted() {
+        let d = tempdir().unwrap();
+        let p = d.path().join("b.txt");
+        fs::write(&p, "old").unwrap();
+        let foreign = d
+            .path()
+            .join(format!(".b.txt.nib-{}.tmp", std::process::id()));
+        fs::write(&foreign, "keep").unwrap();
+        atomic_write(&p, b"new").unwrap();
+        assert_eq!(fs::read(&p).unwrap(), b"new");
+        assert_eq!(fs::read(&foreign).unwrap(), b"keep");
+        let tmps = fs::read_dir(d.path())
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".nib-")
+            })
+            .count();
+        assert_eq!(tmps, 1);
     }
 
     #[cfg(unix)]
