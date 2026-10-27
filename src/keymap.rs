@@ -74,9 +74,11 @@ fn parse_key(raw: &str, lower: &str) -> Result<KeyCode, String> {
         "right" => KeyCode::Right,
         "space" => KeyCode::Char(' '),
         _ => {
-            if let Some(n) = lower.strip_prefix('f').and_then(|n| n.parse::<u8>().ok())
-                && (1..=12).contains(&n)
-            {
+            let fnum = lower
+                .strip_prefix('f')
+                .and_then(|n| n.parse::<u8>().ok())
+                .filter(|n| (1..=12).contains(n));
+            if let Some(n) = fnum {
                 return Ok(KeyCode::F(n));
             }
             let mut chars = raw.chars();
