@@ -41,12 +41,12 @@ regex search · multiple buffers/tabs · block selection · multiple cursors · 
 |---|---|
 | `nib` | Empty buffer. First save asks for a name. |
 | `nib name` (new) | Buffer for `name.txt`. |
-| `nib name.md` / `nib .rc` / `nib Makefile` (new) | Name kept as typed (has extension, or starts with a dot). |
+| `nib name.md` / `nib .rc` / `nib Makefile` (new) | Name kept as typed (has extension, starts with a dot, or is a known extensionless name). |
 | `nib path` (existing) | Opens exactly that file; never renamed. |
 | `nib path:42` | Opens at line 42. Only a trailing `:<digits>` counts, and only when no file with the full name exists (keeps `C:\x.md` safe). |
 | `nib --version`, `nib --help` | Print and exit. |
 
-- The `.txt` rule applies only to new files: no extension **and** not starting with `.`. Same rule for the first-save name prompt.
+- The `.txt` rule applies only to new files: no extension **and** not starting with `.` **and** not one of `Makefile`, `Dockerfile`, `LICENSE`, `README` (matched case-insensitively). Only the final path component is checked, so `notes.d/todo` becomes `notes.d/todo.txt`. Same rule for the first-save name prompt.
 - New files are created on **first save**, never on launch.
 - One file at a time. Opening another file (Ctrl+O) replaces the buffer; unsaved changes prompt
   `Save? (Y)es / (N)o / (C)ancel`. Quit prompts the same way.
