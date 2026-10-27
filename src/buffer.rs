@@ -22,7 +22,9 @@ pub struct Buffer {
 const BOM: &str = "\u{FEFF}";
 
 fn detect_line_ending(s: &str) -> LineEnding {
-    if s.contains("\r\n") {
+    let crlf = s.matches("\r\n").count();
+    let lf = s.matches('\n').count() - crlf;
+    if crlf > lf {
         LineEnding::CrLf
     } else {
         LineEnding::Lf
@@ -36,10 +38,7 @@ impl Buffer {
             None => (false, s),
         };
         let line_ending = detect_line_ending(s);
-        let mut text = match line_ending {
-            LineEnding::CrLf => s.replace("\r\n", "\n"),
-            LineEnding::Lf => s.to_string(),
-        };
+        let mut text = s.replace("\r\n", "\n");
         let final_newline = text.ends_with('\n');
         if final_newline {
             text.pop();
@@ -144,5 +143,57 @@ mod tests {
     #[test]
     fn lone_newline_roundtrip() {
         assert_eq!(roundtrip("\n"), b"\n");
+    }
+
+    #[test]
+    fn mixed_endings_use_majority_and_roundtrip() {
+        let b = Buffer::from_str_detect("a\r\nb\r\nc\nd\r\n");
+        assert_eq!(b.meta.line_ending, LineEnding::CrLf);
+        let out = b.to_bytes();
+        assert_eq!(out, b"a\r\nb\r\nc\r\nd\r\n");
+        assert!(!out.windows(2).any(|w| w == b"\r\r"));
+    }
+
+    #[test]
+    fn mixed_endings_lf_majority() {
+        let b = Buffer::from_str_detect("a\nb\nc\r\nd\n");
+        assert_eq!(b.meta.line_ending, LineEnding::Lf);
+        assert_eq!(b.to_bytes(), b"a\nb\nc\nd\n");
+    }
+
+    #[test]
+    fn mixed_endings_tie_goes_to_lf() {
+        let b = Buffer::from_str_detect("a\r\nb\n");
+        assert_eq!(b.meta.line_ending, LineEnding::Lf);
+        assert_eq!(b.to_bytes(), b"a\nb\n");
+    }
+
+    #[test]
+    fn bom_only_roundtrip() {
+        assert_eq!(roundtrip("\u{FEFF}"), "\u{FEFF}".as_bytes());
+    }
+
+    #[test]
+    fn crlf_without_final_newline_roundtrip() {
+        assert_eq!(roundtrip("a\r\nb"), b"a\r\nb");
+    }
+
+    #[test]
+    fn lone_cr_in_lf_file_roundtrip() {
+        assert_eq!(roundtrip("a\rb"), b"a\rb");
+    }
+
+    #[test]
+    fn lone_cr_is_not_a_line_break() {
+        let b = Buffer::from_str_detect("a\rb\n");
+        assert_eq!(b.rope.to_string(), "a\rb");
+        assert_eq!(b.rope.len_lines(), 1);
+    }
+
+    #[test]
+    fn cr_before_crlf_roundtrips() {
+        let b = Buffer::from_str_detect("a\r\r\nb\r\n");
+        assert_eq!(b.meta.line_ending, LineEnding::CrLf);
+        assert_eq!(b.to_bytes(), b"a\r\r\nb\r\n");
     }
 }
