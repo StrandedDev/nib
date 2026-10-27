@@ -7,4 +7,6 @@ pub mod edit;
 pub mod fileio;
 pub mod keymap;
 pub mod layout;
+pub mod prompt;
+pub mod render;
 pub mod terminal;

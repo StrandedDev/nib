@@ -459,6 +459,38 @@ fn row_cells<'a>(s: RopeSlice<'a>, vp: &Viewport, row: &Row, target: usize) -> C
     }
 }
 
+/// One grapheme as drawn: chars `start..end` of the row's line, at screen x
+/// `x` (relative to the text area) and `w` cells wide.
+pub(crate) struct DrawCell {
+    pub start: usize,
+    pub end: usize,
+    pub x: usize,
+    pub w: usize,
+}
+
+/// The graphemes of `row` that fit on screen, using the same tab, width and
+/// grapheme rules as wrapping. In no-wrap mode a grapheme cut by either edge
+/// is left out, so the caller pads the gap.
+pub(crate) fn draw_cells<'a>(
+    rope: &'a Rope,
+    vp: &Viewport,
+    row: &Row,
+) -> impl Iterator<Item = DrawCell> + 'a {
+    let s = line_text(rope, row.line);
+    let left = if vp.wrap { 0 } else { vp.hscroll };
+    let right = left + usize::from(vp.width);
+    let end_col = row.end_col;
+    row_cells(s, vp, row, left)
+        .take_while(move |c| c.start < end_col && c.x + c.w <= right)
+        .filter(move |c| c.x >= left)
+        .map(move |c| DrawCell {
+            start: c.start,
+            end: c.end,
+            x: c.x - left,
+            w: c.w,
+        })
+}
+
 /// Display x of `cur` on its row (absolute in no-wrap mode).
 fn cursor_x(s: RopeSlice, vp: &Viewport, row_start: usize, cur: Pos) -> usize {
     if vp.wrap {
@@ -1178,5 +1210,50 @@ mod tests {
         v.invalidate();
         assert!(v.wrap_cache.is_none());
         assert_eq!((v.hscroll, v.hscroll_col, v.hscroll_line), (0, 0, 0));
+    }
+
+    fn drawn(rope: &Rope, vp: &Viewport) -> Vec<Vec<(usize, usize, usize)>> {
+        visible_rows(rope, vp)
+            .iter()
+            .map(|r| {
+                draw_cells(rope, vp, r)
+                    .map(|c| (c.start, c.x, c.w))
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn draw_cells_match_row_layout() {
+        // tab to the next stop, wide char wraps whole, combining mark is width 0
+        let rope = Rope::from_str("a\tb\u{4f60}e\u{301}\r");
+        let vp = Viewport::new(6, 5, true, 4);
+        assert_eq!(
+            drawn(&rope, &vp),
+            vec![
+                vec![(0, 0, 1), (1, 1, 3), (2, 4, 1)],
+                vec![(3, 0, 2), (4, 2, 1), (6, 3, 1)],
+            ]
+        );
+    }
+
+    #[test]
+    fn draw_cells_nowrap_clip_to_screen() {
+        let rope = Rope::from_str("\u{4f60}abcdefgh");
+        let mut vp = Viewport::new(4, 5, false, 4);
+        let cur = Pos { line: 0, col: 7 };
+        scroll_to_cursor(&rope, &mut vp, cur, 0);
+        assert_eq!(vp.hscroll, 5);
+        assert_eq!(
+            drawn(&rope, &vp),
+            vec![vec![(4, 0, 1), (5, 1, 1), (6, 2, 1), (7, 3, 1)]]
+        );
+        vp.hscroll = 1;
+        vp.hscroll_line = 9;
+        // the wide char straddles the left edge and is skipped
+        assert_eq!(
+            drawn(&rope, &vp),
+            vec![vec![(1, 1, 1), (2, 2, 1), (3, 3, 1)]]
+        );
     }
 }
