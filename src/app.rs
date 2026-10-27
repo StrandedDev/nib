@@ -3,7 +3,10 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, bail};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
+};
 use crossterm::terminal;
 
 use crate::buffer::{Buffer, LineEnding};
@@ -31,6 +34,8 @@ pub struct App {
     read_only: bool,
     prompt: Option<(Prompt, PromptPurpose)>,
     status: Option<(String, Instant)>,
+    /// Time and cell of the last left-button press, for double-click.
+    last_click: Option<(Instant, u16, u16)>,
     quit: bool,
 }
 
@@ -43,6 +48,8 @@ enum PromptPurpose {
 
 const TAB_WIDTH: u8 = 4;
 const STATUS_FADE: Duration = Duration::from_secs(4);
+const WHEEL_ROWS: isize = 3;
+const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 const POLL: Duration = Duration::from_millis(250);
 const SAVE_CHOICE: &str = "Save? (Y)es / (N)o / (C)ancel";
 
@@ -90,8 +97,8 @@ impl App {
             let mut changed = false;
             if event::poll(POLL)? {
                 let ev = event::read()?;
-                // Mouse capture reports every motion; nothing uses it yet.
-                changed = !matches!(ev, Event::Mouse(_));
+                // Mouse capture reports every motion; nothing uses it.
+                changed = !matches!(&ev, Event::Mouse(m) if m.kind == MouseEventKind::Moved);
                 self.handle_event(ev);
             }
             redraw = self.expire_status(Instant::now()) || changed;
@@ -131,16 +138,31 @@ impl App {
             _ => None,
         };
         if let Some(p) = to {
-            // Selection arrives with Task 3.x; Sel* motions just move for now.
-            self.editor.move_to(p, false);
+            let select = matches!(
+                id,
+                C::SelLeft
+                    | C::SelRight
+                    | C::SelWordLeft
+                    | C::SelWordRight
+                    | C::SelHome
+                    | C::SelEnd
+            );
+            match id {
+                C::Left if self.editor.selection().is_some() => self.editor.collapse(true),
+                C::Right if self.editor.selection().is_some() => self.editor.collapse(false),
+                _ => self.editor.move_to(p, select),
+            }
             return;
         }
         let page = self.viewport.height.max(1) as isize;
         match id {
-            C::Up | C::SelUp => self.vertical(-1),
-            C::Down | C::SelDown => self.vertical(1),
-            C::PageUp => self.vertical(-page),
-            C::PageDown => self.vertical(page),
+            C::Up => self.vertical(-1, false),
+            C::SelUp => self.vertical(-1, true),
+            C::Down => self.vertical(1, false),
+            C::SelDown => self.vertical(1, true),
+            C::PageUp => self.vertical(-page, false),
+            C::PageDown => self.vertical(page, false),
+            C::SelectAll => self.editor.select_all(),
             C::Backspace => self.editor.backspace(),
             C::Delete => self.editor.delete(),
             C::DeleteWordBack => self.editor.delete_word_back(),
@@ -155,7 +177,7 @@ impl App {
         }
     }
 
-    fn vertical(&mut self, rows: isize) {
+    fn vertical(&mut self, rows: isize, select: bool) {
         let e = &mut self.editor;
         let preferred = e
             .preferred_col
@@ -168,7 +190,7 @@ impl App {
             preferred,
             e.buf.version,
         );
-        e.move_to(p, false);
+        e.move_to(p, select);
         e.preferred_col = Some(usize::from(x));
     }
 
@@ -326,7 +348,60 @@ impl App {
                 Some((p, _)) => p.paste(&s),
                 None => self.editor.insert_str(&s),
             },
+            Event::Mouse(m) => {
+                self.handle_mouse_at(m, Instant::now());
+                return;
+            }
             _ => {}
+        }
+        let e = &self.editor;
+        layout::scroll_to_cursor(&e.buf.rope, &mut self.viewport, e.cursor, e.buf.version);
+    }
+
+    /// Mouse handling with an explicit clock, so double-click timing is testable.
+    fn handle_mouse_at(&mut self, m: MouseEvent, now: Instant) {
+        if self.prompt.is_some() {
+            return;
+        }
+        // The text area sits between the title row and the status row.
+        let text_row =
+            |m: &MouseEvent| (m.row >= 1 && m.row <= self.viewport.height).then(|| m.row - 1);
+        let (rope, vp) = (&self.editor.buf.rope, &self.viewport);
+        match m.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                let Some(y) = text_row(&m) else {
+                    return;
+                };
+                let p = layout::screen_to_pos(rope, vp, m.column, y);
+                let prev = self.last_click.take();
+                let double = prev.is_some_and(|(t, x, y0)| {
+                    (x, y0) == (m.column, m.row) && now.saturating_duration_since(t) < DOUBLE_CLICK
+                });
+                if double {
+                    self.editor.select_word(p);
+                } else {
+                    self.editor.move_to(p, false);
+                    self.last_click = Some((now, m.column, m.row));
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                let Some(y) = text_row(&m) else {
+                    return;
+                };
+                let p = layout::screen_to_pos(rope, vp, m.column, y);
+                self.editor.move_to(p, true);
+            }
+            MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
+                let rows = if m.kind == MouseEventKind::ScrollDown {
+                    WHEEL_ROWS
+                } else {
+                    -WHEEL_ROWS
+                };
+                let version = self.editor.buf.version;
+                layout::scroll_rows(rope, &mut self.viewport, rows, version);
+                return;
+            }
+            _ => return,
         }
         let e = &self.editor;
         layout::scroll_to_cursor(&e.buf.rope, &mut self.viewport, e.cursor, e.buf.version);
@@ -344,6 +419,7 @@ impl App {
             read_only: false,
             prompt: None,
             status: None,
+            last_click: None,
             quit: false,
         }
     }
@@ -837,5 +913,150 @@ mod tests {
         let left: Vec<_> = std::fs::read_dir(d.path()).unwrap().collect();
         assert_eq!(left.len(), 1, "only sub/ remains");
         assert_eq!(std::fs::read_dir(&sub).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn shift_right_selects_grapheme() {
+        let mut app = unnamed_with("");
+        app.editor.insert_str("e\u{301}x");
+        app.editor.move_to(pos(0, 0), false);
+        let sh = KeyModifiers::SHIFT;
+        app.handle_event(key(KeyCode::Right, sh));
+        assert_eq!(app.editor.selection(), Some(0..2));
+        app.handle_event(key(KeyCode::Right, sh));
+        assert_eq!(app.editor.selection(), Some(0..3));
+        app.handle_event(key(KeyCode::Left, sh));
+        assert_eq!(app.editor.selection(), Some(0..2));
+    }
+
+    #[test]
+    fn left_collapses_selection_to_start() {
+        let mut app = unnamed_with("abcdef");
+        app.editor.move_to(pos(0, 2), false);
+        let sh = KeyModifiers::SHIFT;
+        app.handle_event(key(KeyCode::Right, sh));
+        app.handle_event(key(KeyCode::Right, sh));
+        app.handle_event(key(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!((app.editor.cursor, app.editor.anchor), (pos(0, 2), None));
+        app.handle_event(key(KeyCode::Right, sh));
+        app.handle_event(key(KeyCode::Right, sh));
+        app.handle_event(key(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!((app.editor.cursor, app.editor.anchor), (pos(0, 4), None));
+    }
+
+    #[test]
+    fn shift_down_keeps_column_and_select_all_via_key() {
+        let mut app = unnamed_with("");
+        app.editor.insert_str("abcdef\nab\nabcdef");
+        app.editor.move_to(pos(0, 5), false);
+        let sh = KeyModifiers::SHIFT;
+        app.handle_event(key(KeyCode::Down, sh));
+        app.handle_event(key(KeyCode::Down, sh));
+        assert_eq!(app.editor.cursor, pos(2, 5));
+        assert_eq!(app.editor.anchor, Some(pos(0, 5)));
+        app.handle_event(key(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        assert_eq!(app.editor.selection(), Some(0..16));
+        app.handle_event(key(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.editor.anchor, None);
+    }
+
+    fn mouse(kind: MouseEventKind, x: u16, y: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn down(x: u16, y: u16) -> MouseEvent {
+        mouse(MouseEventKind::Down(MouseButton::Left), x, y)
+    }
+
+    fn drag(x: u16, y: u16) -> MouseEvent {
+        mouse(MouseEventKind::Drag(MouseButton::Left), x, y)
+    }
+
+    fn doc(text: &str) -> App {
+        let mut app = unnamed_with("");
+        app.editor.insert_str(text);
+        app.editor.move_to(pos(0, 0), false);
+        app
+    }
+
+    #[test]
+    fn drag_extends_selection() {
+        let mut app = doc("hello world\nsecond");
+        let t = Instant::now();
+        app.handle_mouse_at(down(1, 1), t);
+        assert_eq!((app.editor.cursor, app.editor.anchor), (pos(0, 1), None));
+        app.handle_mouse_at(drag(4, 1), t);
+        assert_eq!(app.editor.selection(), Some(1..4));
+        app.handle_mouse_at(drag(2, 2), t);
+        assert_eq!(app.editor.selection(), Some(1..14));
+        // Title and status rows are not text.
+        app.handle_mouse_at(down(0, 0), t);
+        app.handle_mouse_at(down(0, 23), t);
+        assert_eq!(app.editor.selection(), Some(1..14));
+        // Other buttons and motion are ignored.
+        let right = MouseEventKind::Down(MouseButton::Right);
+        app.handle_mouse_at(mouse(right, 0, 1), t);
+        app.handle_mouse_at(mouse(MouseEventKind::Moved, 0, 1), t);
+        assert_eq!(app.editor.selection(), Some(1..14));
+    }
+
+    #[test]
+    fn double_click_selects_word() {
+        let mut app = doc("foo bar  baz\n\nx");
+        let t = Instant::now();
+        let ms = Duration::from_millis;
+        app.handle_mouse_at(down(5, 1), t);
+        assert_eq!(app.editor.selection(), None);
+        app.handle_mouse_at(down(5, 1), t + ms(399));
+        assert_eq!(app.editor.selection(), Some(4..7));
+        // A third click starts over rather than re-selecting.
+        app.handle_mouse_at(down(5, 1), t + ms(500));
+        assert_eq!(app.editor.selection(), None);
+        // Whitespace selects its run.
+        app.handle_mouse_at(down(8, 1), t + ms(2000));
+        app.handle_mouse_at(down(8, 1), t + ms(2100));
+        assert_eq!(app.editor.selection(), Some(7..9));
+        // Too slow, or a different cell: just a click.
+        app.handle_mouse_at(down(1, 1), t + ms(3000));
+        app.handle_mouse_at(down(1, 1), t + ms(3400));
+        assert_eq!(app.editor.selection(), None);
+        app.handle_mouse_at(down(1, 1), t + ms(3500));
+        app.handle_mouse_at(down(2, 1), t + ms(3600));
+        assert_eq!(app.editor.selection(), None);
+        // Empty line: nothing to select.
+        app.handle_mouse_at(down(0, 2), t + ms(4000));
+        app.handle_mouse_at(down(0, 2), t + ms(4100));
+        assert_eq!(app.editor.selection(), None);
+    }
+
+    #[test]
+    fn wheel_scrolls_three_rows_without_moving_cursor() {
+        let text = (0..30)
+            .map(|i| format!("l{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut app = doc(&text);
+        let t = Instant::now();
+        app.handle_mouse_at(mouse(MouseEventKind::ScrollDown, 0, 5), t);
+        assert_eq!(app.viewport.top.line, 3);
+        assert_eq!(app.editor.cursor, pos(0, 0));
+        app.handle_event(Event::Mouse(mouse(MouseEventKind::ScrollDown, 0, 5)));
+        assert_eq!(app.viewport.top.line, 6);
+        app.handle_mouse_at(mouse(MouseEventKind::ScrollUp, 0, 5), t);
+        assert_eq!(app.viewport.top.line, 3);
+        for _ in 0..4 {
+            app.handle_mouse_at(mouse(MouseEventKind::ScrollUp, 0, 5), t);
+        }
+        assert_eq!(app.viewport.top.line, 0);
+        for _ in 0..20 {
+            app.handle_mouse_at(mouse(MouseEventKind::ScrollDown, 0, 5), t);
+        }
+        assert_eq!(app.viewport.top.line, 29);
+        assert_eq!(app.editor.cursor, pos(0, 0));
     }
 }

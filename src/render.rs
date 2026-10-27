@@ -15,7 +15,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::cli;
-use crate::cursor::line_text;
+use crate::cursor::{Pos, from_char_idx, line_text};
 use crate::edit::Editor;
 use crate::layout::{self, Row, Viewport};
 use crate::prompt::Prompt;
@@ -95,17 +95,46 @@ pub fn draw(out: &mut impl Write, app: &AppView) -> io::Result<()> {
     out.flush()
 }
 
+/// Switches reverse video on or off, writing only on a change.
+fn set_reverse(out: &mut impl Write, state: &mut bool, want: bool) -> io::Result<()> {
+    if *state != want {
+        let attr = if want {
+            Attribute::Reverse
+        } else {
+            Attribute::NoReverse
+        };
+        queue!(out, SetAttribute(attr))?;
+        *state = want;
+    }
+    Ok(())
+}
+
 /// Draws one text row from the cursor's current position. Returns the
-/// number of cells written.
+/// number of cells written. Selected cells, and the line end when its
+/// newline is selected, are drawn in reverse video.
 fn draw_row(out: &mut impl Write, app: &AppView, row: &Row) -> io::Result<usize> {
     let rope = &app.editor.buf.rope;
     let s = line_text(rope, row.line);
+    let sel = app
+        .editor
+        .selection()
+        .map(|r| (from_char_idx(rope, r.start), from_char_idx(rope, r.end)));
+    let selected = |col| {
+        let p = Pos {
+            line: row.line,
+            col,
+        };
+        sel.is_some_and(|(a, b)| a <= p && p < b)
+    };
+    let mut rev = false;
     let mut x = 0;
     for c in layout::draw_cells(rope, app.viewport, row) {
         if c.x > x {
+            set_reverse(out, &mut rev, false)?;
             queue!(out, Print(" ".repeat(c.x - x)))?;
         }
         x = c.x + c.w;
+        set_reverse(out, &mut rev, selected(c.start))?;
         let g = s.slice(c.start..c.end);
         if g.char(0) == '\t' {
             queue!(out, Print(" ".repeat(c.w)))?;
@@ -125,6 +154,13 @@ fn draw_row(out: &mut impl Write, app: &AppView, row: &Row) -> io::Result<usize>
             // A lone zero-width grapheme would merge with its neighbour.
         }
     }
+    let len = s.len_chars();
+    if row.end_col == len && x < usize::from(app.viewport.width) && selected(len) {
+        set_reverse(out, &mut rev, true)?;
+        queue!(out, Print(' '))?;
+        x += 1;
+    }
+    set_reverse(out, &mut rev, false)?;
     Ok(x)
 }
 
@@ -272,5 +308,51 @@ mod tests {
             assert!(title_bar(w, "x\u{1b}y", "Modified [Read-only]").width() <= w);
         }
         assert!(!title_bar(40, "x\u{1b}y", "").contains('\u{1b}'));
+    }
+
+    fn frame(text: &str, width: u16, sel: (Pos, Pos)) -> String {
+        let mut e = Editor::new(crate::buffer::Buffer::from_str_detect(text));
+        e.move_to(sel.0, false);
+        e.move_to(sel.1, true);
+        let vp = Viewport::new(width, 6, true, 4);
+        let view = AppView {
+            editor: &e,
+            viewport: &vp,
+            screen: (width, 8),
+            name: String::new(),
+            state: String::new(),
+            status: None,
+            prompt: None,
+        };
+        let mut out = Vec::new();
+        draw(&mut out, &view).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    fn pos(line: usize, col: usize) -> Pos {
+        Pos { line, col }
+    }
+
+    #[test]
+    fn selection_drawn_in_reverse_video() {
+        let f = frame("hello", 20, (pos(0, 1), pos(0, 3)));
+        assert!(f.contains("h\u{1b}[7mel\u{1b}[27mlo"), "{f:?}");
+        let none = frame("hello", 20, (pos(0, 1), pos(0, 1)));
+        assert!(!none.contains("h\u{1b}[7m"), "{none:?}");
+    }
+
+    #[test]
+    fn selection_covers_line_ends_and_wrapped_rows() {
+        // The newline of "ab" is selected: one reversed space after it.
+        let f = frame("ab\ncd", 20, (pos(0, 1), pos(1, 1)));
+        assert!(f.contains("a\u{1b}[7mb \u{1b}[27m"), "{f:?}");
+        assert!(f.contains("\u{1b}[7mc\u{1b}[27md"), "{f:?}");
+        // An empty line inside the selection shows as one reversed space.
+        let f = frame("a\n\nb", 20, (pos(0, 0), pos(2, 0)));
+        assert!(f.contains("\u{1b}[7m \u{1b}[27m"), "{f:?}");
+        // Wrapped: both rows carry reverse video.
+        let f = frame("abcdefgh", 4, (pos(0, 2), pos(0, 6)));
+        assert!(f.contains("ab\u{1b}[7mcd\u{1b}[27m"), "{f:?}");
+        assert!(f.contains("\u{1b}[7mef\u{1b}[27mgh"), "{f:?}");
     }
 }

@@ -668,6 +668,37 @@ pub fn move_vertical(
     (land(rope, vp, row, x), clamp_u16(x))
 }
 
+/// Moves the top of the window `rows` screen rows (negative is up), stopping
+/// at the first and last row of the buffer. The cursor is not considered.
+pub fn scroll_rows(rope: &Rope, vp: &mut Viewport, rows: isize, version: u64) {
+    let mut top = locate_top(rope, vp);
+    if rows > 0 {
+        let mut it = RowIter::new(rope, vp, top.line, top.start_col);
+        it.next();
+        for _ in 0..rows {
+            match it.next() {
+                Some(n) => top = n,
+                None => break,
+            }
+        }
+    } else {
+        for _ in 0..rows.unsigned_abs() {
+            match prev_row(rope, vp, version, top) {
+                Some(p) => top = p,
+                None => break,
+            }
+        }
+    }
+    vp.top = top;
+}
+
+/// `vp.top` as a real row of the buffer (its `end_col` may be stale).
+fn locate_top(rope: &Rope, vp: &Viewport) -> Row {
+    RowIter::new(rope, vp, vp.top.line, vp.top.start_col)
+        .next()
+        .unwrap_or(vp.top)
+}
+
 /// Adjusts `vp.top` (and the horizontal anchor when not wrapping) so `cur` is
 /// visible. Nothing changes when it already is; a nearby cursor below scrolls
 /// row by row; anything else puts the cursor's row at the top.

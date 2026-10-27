@@ -75,8 +75,8 @@ so Ctrl+S / Ctrl+Q reach nib.
 
 ## 5. Editing
 
-- **Selection:** one linear selection, any number of lines.
-- **Mouse:** click places cursor · drag selects · double-click selects word · wheel scrolls. Nothing else.
+- **Selection:** one linear selection, any number of lines, drawn in reverse video (a selected line end shows as one reversed space). Typing, Backspace, Delete and word-delete replace/remove exactly the selection. Plain Left/Right collapse to the selection's start/end. An empty selection counts as none.
+- **Mouse:** click places cursor · drag selects · double-click (second press within 400 ms on the same cell) selects the word, punctuation or whitespace run under it · wheel scrolls 3 rows without moving the cursor. Clicks on the title or status row, other buttons and motion are ignored.
 - **Find:** incremental (highlights as you type), smart case (insensitive unless the query has a capital), plain text.
 - **Replace:** per match — this one / all / skip.
 - **Undo/redo:** in memory per session; typing grouped by word/pause.

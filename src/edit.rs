@@ -1,5 +1,7 @@
 //! Text mutations over a buffer and cursor.
 
+use std::ops::Range;
+
 use crate::buffer::Buffer;
 use crate::cursor::{self, Pos};
 
@@ -20,25 +22,60 @@ impl Editor {
         }
     }
 
+    /// The selected char range, ordered; `None` when there is no anchor or it
+    /// sits on the cursor.
+    pub fn selection(&self) -> Option<Range<usize>> {
+        let rope = &self.buf.rope;
+        let a = cursor::to_char_idx(rope, self.anchor?);
+        let c = cursor::to_char_idx(rope, self.cursor);
+        (a != c).then(|| a.min(c)..a.max(c))
+    }
+
+    pub fn select_all(&mut self) {
+        self.move_to(cursor::file_start(&self.buf.rope), false);
+        self.move_to(cursor::file_end(&self.buf.rope), true);
+    }
+
+    /// Drops the selection, leaving the cursor at its start (`to_start`) or end.
+    pub fn collapse(&mut self, to_start: bool) {
+        let Some(r) = self.selection() else {
+            return;
+        };
+        let at = if to_start { r.start } else { r.end };
+        self.move_to(cursor::from_char_idx(&self.buf.rope, at), false);
+    }
+
+    /// Selects the word, punctuation or whitespace run under `pos`.
+    pub fn select_word(&mut self, pos: Pos) {
+        let (start, end) = cursor::word_at(&self.buf.rope, pos);
+        self.move_to(start, false);
+        self.move_to(end, true);
+    }
+
     pub fn insert_str(&mut self, s: &str) {
         if s.is_empty() {
             return;
         }
         let s = s.replace("\r\n", "\n");
-        let at = cursor::to_char_idx(&self.buf.rope, self.cursor);
-        self.buf.rope.insert(at, &s);
-        self.buf.dirty = true;
-        self.buf.version += 1;
-        self.cursor = cursor::from_char_idx(&self.buf.rope, at + s.chars().count());
-        self.preferred_col = None;
+        let range = self.selection().unwrap_or_else(|| {
+            let at = cursor::to_char_idx(&self.buf.rope, self.cursor);
+            at..at
+        });
+        self.replace_range(range, &s);
     }
 
     pub fn backspace(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
         let start = cursor::left(&self.buf.rope, self.cursor);
         self.delete_range(start, self.cursor);
     }
 
     pub fn delete(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
         let end = cursor::right(&self.buf.rope, self.cursor);
         self.delete_range(self.cursor, end);
     }
@@ -48,11 +85,17 @@ impl Editor {
     }
 
     pub fn delete_word_back(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
         let start = cursor::word_left(&self.buf.rope, self.cursor);
         self.delete_range(start, self.cursor);
     }
 
     pub fn delete_word_fwd(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
         let end = cursor::word_right(&self.buf.rope, self.cursor);
         self.delete_range(self.cursor, end);
     }
@@ -68,17 +111,39 @@ impl Editor {
         self.preferred_col = None;
     }
 
+    /// Removes the selection, if any. Returns whether there was one.
+    fn delete_selection(&mut self) -> bool {
+        match self.selection() {
+            Some(r) => {
+                self.replace_range(r, "");
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Removes `[start, end)` and puts the cursor at `start`; empty ranges are no-ops.
     fn delete_range(&mut self, start: Pos, end: Pos) {
         let a = cursor::to_char_idx(&self.buf.rope, start);
         let b = cursor::to_char_idx(&self.buf.rope, end);
-        if a >= b {
+        self.replace_range(a..b, "");
+    }
+
+    /// The one mutation path: replaces chars `range` with `s`, leaves the
+    /// cursor after `s`, and drops the anchor. Empty-for-empty is a no-op.
+    fn replace_range(&mut self, range: Range<usize>, s: &str) {
+        if range.start >= range.end && s.is_empty() {
             return;
         }
-        self.buf.rope.remove(a..b);
+        let at = range.start;
+        if range.start < range.end {
+            self.buf.rope.remove(range);
+        }
+        self.buf.rope.insert(at, s);
         self.buf.dirty = true;
         self.buf.version += 1;
-        self.cursor = cursor::from_char_idx(&self.buf.rope, a);
+        self.cursor = cursor::from_char_idx(&self.buf.rope, at + s.chars().count());
+        self.anchor = None;
         self.preferred_col = None;
     }
 }
@@ -232,5 +297,93 @@ mod tests {
         assert_eq!(e.buf.version, 1);
         e.backspace();
         assert_eq!(e.buf.version, 2);
+    }
+
+    #[test]
+    fn selection_is_ordered_char_range_and_empty_is_none() {
+        let mut e = ed("ab
+cd");
+        assert_eq!(e.selection(), None);
+        e.move_to(pos(1, 1), false);
+        e.move_to(pos(0, 1), true);
+        assert_eq!(e.selection(), Some(1..4));
+        e.move_to(pos(1, 1), false);
+        e.move_to(pos(1, 1), true);
+        assert_eq!(e.selection(), None);
+    }
+
+    #[test]
+    fn typing_replaces_selection() {
+        let mut e = ed("hello world");
+        e.move_to(pos(0, 6), false);
+        e.move_to(pos(0, 11), true);
+        e.insert_str("rust");
+        assert_eq!(text(&e), "hello rust");
+        assert_eq!(e.cursor, pos(0, 10));
+        assert_eq!(e.anchor, None);
+        assert_eq!(e.buf.version, 1, "one mutation");
+    }
+
+    #[test]
+    fn edit_clears_anchor() {
+        let ops: [fn(&mut Editor); 5] = [
+            |e| e.insert_str("x"),
+            |e| e.backspace(),
+            |e| e.delete(),
+            |e| e.delete_word_back(),
+            |e| e.delete_word_fwd(),
+        ];
+        for op in ops {
+            let mut e = ed("foo bar baz");
+            e.move_to(pos(0, 4), false);
+            e.move_to(pos(0, 7), true);
+            op(&mut e);
+            assert_eq!(e.anchor, None);
+            assert!(text(&e).starts_with("foo "), "{}", text(&e));
+            assert!(text(&e).ends_with(" baz"), "{}", text(&e));
+            assert_eq!(e.cursor, pos(0, if text(&e).len() == 8 { 4 } else { 5 }));
+        }
+        // An anchor left past the end of a shrunken buffer is clamped.
+        let mut e = ed("abc");
+        e.anchor = Some(pos(5, 5));
+        assert_eq!(e.selection(), Some(0..3));
+        e.cursor = pos(0, 3);
+        e.insert_str("d");
+        assert_eq!(e.anchor, None);
+    }
+
+    #[test]
+    fn deleting_selection_across_lines() {
+        let mut e = ed("ab\ncd\nef");
+        e.move_to(pos(0, 1), false);
+        e.move_to(pos(2, 1), true);
+        e.backspace();
+        assert_eq!(text(&e), "af");
+        assert_eq!(e.cursor, pos(0, 1));
+        assert_eq!(e.buf.version, 1);
+    }
+
+    #[test]
+    fn select_all_covers_buffer() {
+        let mut e = ed("ab\ncd");
+        e.select_all();
+        assert_eq!(e.selection(), Some(0..5));
+        assert_eq!((e.anchor, e.cursor), (Some(pos(0, 0)), pos(1, 2)));
+        let mut e = ed("");
+        e.select_all();
+        assert_eq!(e.selection(), None);
+    }
+
+    #[test]
+    fn collapse_goes_to_selection_edges() {
+        let mut e = ed("abcd");
+        e.move_to(pos(0, 3), false);
+        e.move_to(pos(0, 1), true);
+        e.collapse(false);
+        assert_eq!((e.cursor, e.anchor), (pos(0, 3), None));
+        e.move_to(pos(0, 3), true);
+        e.move_to(pos(0, 1), true);
+        e.collapse(true);
+        assert_eq!((e.cursor, e.anchor), (pos(0, 1), None));
     }
 }

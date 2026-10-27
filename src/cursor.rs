@@ -199,6 +199,36 @@ pub fn word_right(rope: &Rope, p: Pos) -> Pos {
     Pos { line: p.line, col }
 }
 
+/// Bounds of the run of same-class graphemes (word, punctuation or space)
+/// under `p`; at the end of a line, the last run. Empty on an empty line.
+pub(crate) fn word_at(rope: &Rope, p: Pos) -> (Pos, Pos) {
+    let p = clamp(rope, p);
+    let s = line_text(rope, p.line);
+    let len = s.len_chars();
+    let at = |col| Pos { line: p.line, col };
+    if len == 0 {
+        return (p, p);
+    }
+    let mut start = if p.col >= len {
+        prev_col(s, len)
+    } else {
+        p.col
+    };
+    let class = classify(s.char(start));
+    let mut end = next_col(s, start);
+    while start > 0 {
+        let pc = prev_col(s, start);
+        if classify(s.char(pc)) != class {
+            break;
+        }
+        start = pc;
+    }
+    while end < len && classify(s.char(end)) == class {
+        end = next_col(s, end);
+    }
+    (at(start), at(end))
+}
+
 pub fn line_start(_rope: &Rope, p: Pos) -> Pos {
     Pos {
         line: p.line,
@@ -369,5 +399,17 @@ cde",
         assert_eq!(file_end(&r), z);
         assert_eq!(from_char_idx(&r, 5), z);
         assert_eq!(to_char_idx(&r, z), 0);
+    }
+
+    #[test]
+    fn word_at_picks_class_run() {
+        let r = Rope::from_str("foo_1  ==x\n\nab");
+        assert_eq!(word_at(&r, pos(0, 2)), (pos(0, 0), pos(0, 5)));
+        assert_eq!(word_at(&r, pos(0, 5)), (pos(0, 5), pos(0, 7)));
+        assert_eq!(word_at(&r, pos(0, 8)), (pos(0, 7), pos(0, 9)));
+        // Past the end of the line: the last run.
+        assert_eq!(word_at(&r, pos(0, 10)), (pos(0, 9), pos(0, 10)));
+        // Empty line: nothing to select.
+        assert_eq!(word_at(&r, pos(1, 0)), (pos(1, 0), pos(1, 0)));
     }
 }
