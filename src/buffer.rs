@@ -17,6 +17,8 @@ pub struct Buffer {
     pub rope: Rope,
     pub meta: TextMeta,
     pub dirty: bool,
+    /// Bumped on every real text change; keys layout caches.
+    pub version: u64,
 }
 
 const BOM: &str = "\u{FEFF}";
@@ -51,6 +53,7 @@ impl Buffer {
                 final_newline,
             },
             dirty: false,
+            version: 0,
         }
     }
 
@@ -63,6 +66,7 @@ impl Buffer {
                 final_newline: true,
             },
             dirty: false,
+            version: 0,
         }
     }
 

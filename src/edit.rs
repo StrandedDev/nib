@@ -28,6 +28,7 @@ impl Editor {
         let at = cursor::to_char_idx(&self.buf.rope, self.cursor);
         self.buf.rope.insert(at, &s);
         self.buf.dirty = true;
+        self.buf.version += 1;
         self.cursor = cursor::from_char_idx(&self.buf.rope, at + s.chars().count());
         self.preferred_col = None;
     }
@@ -76,6 +77,7 @@ impl Editor {
         }
         self.buf.rope.remove(a..b);
         self.buf.dirty = true;
+        self.buf.version += 1;
         self.cursor = cursor::from_char_idx(&self.buf.rope, a);
         self.preferred_col = None;
     }
@@ -216,5 +218,19 @@ mod tests {
         e.preferred_col = Some(5);
         e.move_to(pos(0, 0), false);
         assert_eq!(e.preferred_col, None);
+    }
+
+    #[test]
+    fn real_edits_bump_buffer_version() {
+        let mut e = ed("ab");
+        assert_eq!(e.buf.version, 0);
+        e.insert_str("");
+        e.cursor = pos(0, 2);
+        e.delete();
+        assert_eq!(e.buf.version, 0, "no-ops do not bump");
+        e.insert_str("x");
+        assert_eq!(e.buf.version, 1);
+        e.backspace();
+        assert_eq!(e.buf.version, 2);
     }
 }

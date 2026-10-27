@@ -102,6 +102,8 @@ fn snap(s: RopeSlice, col: usize) -> usize {
     let len = s.len_chars();
     if col >= len {
         len
+    } else if col > 0 && s.char(col - 1).is_ascii() && s.char(col).is_ascii() {
+        col // adjacent ASCII chars are separate clusters (a line has no LF)
     } else {
         prev_col(s, next_col(s, col))
     }
