@@ -54,12 +54,21 @@ fn resolve_target(path: &Path) -> io::Result<PathBuf> {
     Err(io::Error::other("too many levels of symbolic links"))
 }
 
+/// Directory that holds `target`; a bare relative name maps to `.` so the
+/// directory fsync after rename still runs.
+pub(crate) fn save_dir(target: &Path) -> &Path {
+    match target.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    }
+}
+
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let target = resolve_target(path)?;
     let name = target
         .file_name()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
-    let dir = target.parent().unwrap_or(Path::new("."));
+    let dir = save_dir(&target);
     let pid = std::process::id();
 
     // Only a temp file this call created is ever removed.
@@ -140,11 +149,7 @@ pub fn is_writable(path: &Path) -> bool {
     if path.exists() {
         return OpenOptions::new().write(true).open(path).is_ok();
     }
-    let dir: PathBuf = match path.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
-        _ => PathBuf::from("."),
-    };
-    let probe = dir.join(format!(".nib-probe-{}", std::process::id()));
+    let probe = save_dir(path).join(format!(".nib-probe-{}", std::process::id()));
     let ok = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -251,6 +256,12 @@ mod tests {
         assert_eq!(fs::read(&p).unwrap(), b"new content");
         let names: Vec<_> = fs::read_dir(d.path()).unwrap().collect();
         assert_eq!(names.len(), 1);
+    }
+
+    #[test]
+    fn atomic_write_bare_relative_name() {
+        assert_eq!(save_dir(Path::new("a.txt")), Path::new("."));
+        assert_eq!(save_dir(Path::new("d/a.txt")), Path::new("d"));
     }
 
     #[test]
