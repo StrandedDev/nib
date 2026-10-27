@@ -19,6 +19,8 @@ arboard = { version = "3.7.0", default-features = false, features = ["wayland-da
 base64 = "0.23.1" # OSC 52 clipboard
 crossterm = "0.29.0"
 dirs = "7.0.0"
+# local time + DST for the title bar mtime (std has no time zones); about 300 KB
+jiff = { version = "0.2.38", default-features = false, features = ["std", "tz-system"] }
 # only newline breaks lines; carriage return kept literal
 ropey = { version = "1.6.1", default-features = false, features = ["simd"] }
 serde = { version = "1.0.229", features = ["derive"] }
