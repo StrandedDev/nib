@@ -1,0 +1,42 @@
+[package]
+name = "nib"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "A small, fast, distraction-free terminal text editor"
+license = "MIT"
+authors = ["StrandedDev"]
+repository = "https://github.com/StrandedDev/nib"
+readme = "README.md"
+keywords = ["editor", "terminal", "tui", "text-editor", "notes"]
+categories = ["command-line-utilities", "text-editors"]
+publish = false # "nib" is taken on crates.io; install via releases or `cargo install --git`
+
+[dependencies]
+anyhow = "1.0.104"
+# No image support: keeps the binary small. Wayland support for Linux clipboard.
+arboard = { version = "3.7.0", default-features = false, features = ["wayland-data-control"] }
+base64 = "0.23.1" # OSC 52 clipboard
+crossterm = "0.29.0"
+dirs = "7.0.0"
+ropey = "1.6.1"
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.1.8"
+unicode-segmentation = "1.13.3"
+unicode-width = "0.2.2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort" # panic hook still runs first and restores the terminal
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
