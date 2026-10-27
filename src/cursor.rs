@@ -1,9 +1,11 @@
 //! Pure cursor motion over a rope, in grapheme clusters.
 //!
 //! `col` is a char index within the line, excluding the trailing `\n`.
+//! Segmentation runs over rope chunks of the single line, so the cost of a
+//! step is proportional to the grapheme, not the line.
 
-use ropey::Rope;
-use unicode_segmentation::UnicodeSegmentation;
+use ropey::{Rope, RopeSlice};
+use unicode_segmentation::{GraphemeCursor, GraphemeIncomplete};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub struct Pos {
@@ -18,8 +20,7 @@ enum Class {
     Punct,
 }
 
-fn classify(g: &str) -> Class {
-    let c = g.chars().next().unwrap_or(' ');
+fn classify(c: char) -> Class {
     if c.is_whitespace() {
         Class::Space
     } else if c.is_alphanumeric() || c == '_' {
@@ -29,50 +30,97 @@ fn classify(g: &str) -> Class {
     }
 }
 
-/// Grapheme clusters of a line as (start col, class), plus the line length in chars.
-fn clusters(rope: &Rope, line: usize) -> (Vec<(usize, Class)>, usize) {
-    let text = rope.line(line).to_string();
-    let text = text.strip_suffix('\n').unwrap_or(&text);
-    let mut out = Vec::new();
-    let mut col = 0;
-    for g in text.graphemes(true) {
-        out.push((col, classify(g)));
-        col += g.chars().count();
-    }
-    (out, col)
-}
-
 fn last_line(rope: &Rope) -> usize {
     rope.len_lines() - 1
 }
 
+/// The line's text without its trailing `\n`.
+fn line_text(rope: &Rope, line: usize) -> RopeSlice<'_> {
+    let s = rope.line(line);
+    let n = s.len_chars();
+    if n > 0 && s.char(n - 1) == '\n' {
+        s.slice(..n - 1)
+    } else {
+        s
+    }
+}
+
 fn line_len(rope: &Rope, line: usize) -> usize {
-    clusters(rope, line).1
+    line_text(rope, line).len_chars()
+}
+
+fn next_boundary(s: RopeSlice, byte: usize) -> usize {
+    let len = s.len_bytes();
+    let mut gc = GraphemeCursor::new(byte, len, true);
+    let (mut chunk, mut chunk_start, _, _) = s.chunk_at_byte(byte);
+    loop {
+        match gc.next_boundary(chunk, chunk_start) {
+            Ok(None) => return len,
+            Ok(Some(n)) => return n,
+            Err(GraphemeIncomplete::NextChunk) => {
+                chunk_start += chunk.len();
+                chunk = s.chunk_at_byte(chunk_start).0;
+            }
+            Err(GraphemeIncomplete::PreContext(n)) => {
+                let (ctx, ctx_start, _, _) = s.chunk_at_byte(n - 1);
+                gc.provide_context(ctx, ctx_start);
+            }
+            Err(_) => return len,
+        }
+    }
+}
+
+fn prev_boundary(s: RopeSlice, byte: usize) -> usize {
+    let mut gc = GraphemeCursor::new(byte, s.len_bytes(), true);
+    let (mut chunk, mut chunk_start, _, _) = s.chunk_at_byte(byte.saturating_sub(1));
+    loop {
+        match gc.prev_boundary(chunk, chunk_start) {
+            Ok(None) => return 0,
+            Ok(Some(n)) => return n,
+            Err(GraphemeIncomplete::PrevChunk) => {
+                (chunk, chunk_start, _, _) = s.chunk_at_byte(chunk_start - 1);
+            }
+            Err(GraphemeIncomplete::PreContext(n)) => {
+                let (ctx, ctx_start, _, _) = s.chunk_at_byte(n - 1);
+                gc.provide_context(ctx, ctx_start);
+            }
+            Err(_) => return 0,
+        }
+    }
+}
+
+fn next_col(s: RopeSlice, col: usize) -> usize {
+    s.byte_to_char(next_boundary(s, s.char_to_byte(col)))
+}
+
+fn prev_col(s: RopeSlice, col: usize) -> usize {
+    s.byte_to_char(prev_boundary(s, s.char_to_byte(col)))
+}
+
+/// Start of the grapheme containing `col`; `len` when at or past the end.
+fn snap(s: RopeSlice, col: usize) -> usize {
+    let len = s.len_chars();
+    if col >= len {
+        len
+    } else {
+        prev_col(s, next_col(s, col))
+    }
 }
 
 pub fn clamp(rope: &Rope, p: Pos) -> Pos {
     let line = p.line.min(last_line(rope));
-    let (cl, len) = clusters(rope, line);
-    let col = if p.col >= len {
-        len
-    } else {
-        cl.iter()
-            .map(|c| c.0)
-            .take_while(|&s| s <= p.col)
-            .last()
-            .unwrap_or(0)
-    };
-    Pos { line, col }
+    Pos {
+        line,
+        col: snap(line_text(rope, line), p.col),
+    }
 }
 
 pub fn left(rope: &Rope, p: Pos) -> Pos {
     let p = clamp(rope, p);
     if p.col > 0 {
-        let (cl, _) = clusters(rope, p.line);
-        let col = cl.iter().map(|c| c.0).take_while(|&s| s < p.col).last();
         Pos {
             line: p.line,
-            col: col.unwrap_or(0),
+            col: prev_col(line_text(rope, p.line), p.col),
         }
     } else if p.line > 0 {
         Pos {
@@ -86,10 +134,12 @@ pub fn left(rope: &Rope, p: Pos) -> Pos {
 
 pub fn right(rope: &Rope, p: Pos) -> Pos {
     let p = clamp(rope, p);
-    let (cl, len) = clusters(rope, p.line);
-    if p.col < len {
-        let col = cl.iter().map(|c| c.0).find(|&s| s > p.col).unwrap_or(len);
-        Pos { line: p.line, col }
+    let s = line_text(rope, p.line);
+    if p.col < s.len_chars() {
+        Pos {
+            line: p.line,
+            col: next_col(s, p.col),
+        }
     } else if p.line < last_line(rope) {
         Pos {
             line: p.line + 1,
@@ -105,43 +155,46 @@ pub fn word_left(rope: &Rope, p: Pos) -> Pos {
     if p.col == 0 {
         return left(rope, p);
     }
-    let (cl, _) = clusters(rope, p.line);
-    let mut i = cl.iter().take_while(|c| c.0 < p.col).count();
-    while i > 0 && cl[i - 1].1 == Class::Space {
-        i -= 1;
+    let s = line_text(rope, p.line);
+    let mut col = p.col;
+    while col > 0 {
+        let pc = prev_col(s, col);
+        if classify(s.char(pc)) != Class::Space {
+            break;
+        }
+        col = pc;
     }
-    if i > 0 {
-        let class = cl[i - 1].1;
-        while i > 0 && cl[i - 1].1 == class {
-            i -= 1;
+    if col > 0 {
+        let class = classify(s.char(prev_col(s, col)));
+        while col > 0 {
+            let pc = prev_col(s, col);
+            if classify(s.char(pc)) != class {
+                break;
+            }
+            col = pc;
         }
     }
-    Pos {
-        line: p.line,
-        col: cl.get(i).map_or(0, |c| c.0),
-    }
+    Pos { line: p.line, col }
 }
 
 pub fn word_right(rope: &Rope, p: Pos) -> Pos {
     let p = clamp(rope, p);
-    let (cl, len) = clusters(rope, p.line);
+    let s = line_text(rope, p.line);
+    let len = s.len_chars();
     if p.col >= len {
         return right(rope, p);
     }
-    let mut i = cl.iter().take_while(|c| c.0 < p.col).count();
-    while i < cl.len() && cl[i].1 == Class::Space {
-        i += 1;
+    let mut col = p.col;
+    while col < len && classify(s.char(col)) == Class::Space {
+        col = next_col(s, col);
     }
-    if i < cl.len() {
-        let class = cl[i].1;
-        while i < cl.len() && cl[i].1 == class {
-            i += 1;
+    if col < len {
+        let class = classify(s.char(col));
+        while col < len && classify(s.char(col)) == class {
+            col = next_col(s, col);
         }
     }
-    Pos {
-        line: p.line,
-        col: cl.get(i).map_or(len, |c| c.0),
-    }
+    Pos { line: p.line, col }
 }
 
 pub fn line_start(_rope: &Rope, p: Pos) -> Pos {
@@ -274,5 +327,45 @@ cde",
         assert_eq!(from_char_idx(&r, 5), pos(1, 2));
         assert_eq!(from_char_idx(&r, 2), pos(0, 2));
         assert_eq!(from_char_idx(&r, 99), pos(1, 3));
+    }
+
+    #[test]
+    fn long_line_motion_is_local() {
+        let mut text = "a".repeat(2_500_000);
+        text.push('😀');
+        text.push_str(&"a".repeat(2_500_000));
+        let r = Rope::from_str(&text);
+        let start = std::time::Instant::now();
+        let mut p = pos(0, 2_500_000);
+        for _ in 0..1000 {
+            p = right(&r, p);
+        }
+        for _ in 0..1000 {
+            p = left(&r, p);
+        }
+        assert_eq!(p, pos(0, 2_500_000));
+        assert!(start.elapsed().as_millis() < 200, "{:?}", start.elapsed());
+    }
+
+    #[test]
+    fn lone_cr_before_newline_is_own_cluster() {
+        let r = Rope::from_str("a\r\nb");
+        assert_eq!(right(&r, pos(0, 1)), pos(0, 2));
+        assert_eq!(right(&r, pos(0, 2)), pos(1, 0));
+        assert_eq!(left(&r, pos(0, 2)), pos(0, 1));
+    }
+
+    #[test]
+    fn empty_rope_motions_noop() {
+        let r = Rope::new();
+        let z = pos(0, 0);
+        assert_eq!(left(&r, z), z);
+        assert_eq!(right(&r, z), z);
+        assert_eq!(word_left(&r, z), z);
+        assert_eq!(word_right(&r, z), z);
+        assert_eq!(clamp(&r, pos(3, 3)), z);
+        assert_eq!(file_end(&r), z);
+        assert_eq!(from_char_idx(&r, 5), z);
+        assert_eq!(to_char_idx(&r, z), 0);
     }
 }
