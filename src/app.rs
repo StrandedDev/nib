@@ -34,10 +34,11 @@ pub struct App {
     quit: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum PromptPurpose {
     SaveBeforeQuit,
     SaveName { then_quit: bool },
+    ConfirmReplace { path: PathBuf, then_quit: bool },
 }
 
 const TAB_WIDTH: u8 = 4;
@@ -234,27 +235,24 @@ impl App {
     }
 
     fn prompt_key(&mut self, key: &KeyEvent) {
-        let Some((prompt, purpose)) = &mut self.prompt else {
+        let Some((prompt, _)) = &mut self.prompt else {
             return;
         };
-        let purpose = *purpose;
         let result = prompt.handle_key(key);
         if result == PromptResult::Pending {
             return;
         }
-        self.prompt = None;
+        let Some((_, purpose)) = self.prompt.take() else {
+            return;
+        };
         match (purpose, result) {
             (PromptPurpose::SaveName { then_quit }, PromptResult::Submit(name)) => {
-                let name = name.trim();
-                if name.is_empty() {
-                    return;
-                }
-                let path = PathBuf::from(cli::new_file_name(name));
-                let path = std::path::absolute(&path).unwrap_or(path);
-                if self.save_to(path) && then_quit {
-                    self.quit = true;
-                }
+                self.save_named(&name, then_quit);
             }
+            (PromptPurpose::ConfirmReplace { path, then_quit }, PromptResult::Choice('y')) => {
+                self.save_then(path, then_quit);
+            }
+            (PromptPurpose::ConfirmReplace { .. }, _) => self.set_status("Not saved"),
             (PromptPurpose::SaveBeforeQuit, PromptResult::Choice('y')) => {
                 if self.save(true) {
                     self.quit = true;
@@ -262,6 +260,40 @@ impl App {
             }
             (PromptPurpose::SaveBeforeQuit, PromptResult::Choice('n')) => self.quit = true,
             _ => {}
+        }
+    }
+
+    /// First save under a typed name. An existing target is only replaced
+    /// after a yes.
+    fn save_named(&mut self, name: &str, then_quit: bool) {
+        let name = name.trim();
+        if name.is_empty() {
+            return;
+        }
+        // Same rules as the command line: an existing name is kept as typed,
+        // a new one gets the .txt rule. A `:N` suffix is dropped.
+        let (path, _) = cli::resolve(name, |p| p.exists());
+        let path = std::path::absolute(&path).unwrap_or(path);
+        // `new_file_name` splits on both separators, so this does too.
+        let no_name = name.ends_with(['/', '\\']) || Path::new(name).file_name().is_none();
+        if no_name || path.is_dir() {
+            self.set_status("Not a file name");
+            return;
+        }
+        if path.exists() {
+            let p = Prompt::Choice {
+                label: format!("{} exists. Replace? (y/N)", file_name(&path)),
+                keys: &['y', 'n'],
+            };
+            self.prompt = Some((p, PromptPurpose::ConfirmReplace { path, then_quit }));
+        } else {
+            self.save_then(path, then_quit);
+        }
+    }
+
+    fn save_then(&mut self, path: PathBuf, then_quit: bool) {
+        if self.save_to(path) && then_quit {
+            self.quit = true;
         }
     }
 
@@ -682,5 +714,128 @@ mod tests {
         assert!(app.expire_status(at(4000)));
         assert_eq!(app.status_text(), None);
         assert!(!app.expire_status(at(5000)));
+    }
+
+    fn unnamed_with(text: &str) -> App {
+        let mut app = App::from_buffer(Buffer::new_empty(LineEnding::Lf), None);
+        typ(&mut app, text);
+        app
+    }
+
+    fn submit_name(app: &mut App, p: &std::path::Path) {
+        typ(app, &p.to_string_lossy());
+        app.handle_event(key(KeyCode::Enter, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn name_prompt_existing_file_asks_before_replacing() {
+        let d = tempdir().unwrap();
+        let p = d.path().join("old.txt");
+        std::fs::write(&p, "old").unwrap();
+        let mut app = unnamed_with("hi");
+        app.dispatch(CommandId::Save);
+        submit_name(&mut app, &p);
+        match &app.prompt {
+            Some((Prompt::Choice { label, keys }, _)) => {
+                assert_eq!(label, "old.txt exists. Replace? (y/N)");
+                assert_eq!(*keys, &['y', 'n']);
+            }
+            _ => panic!("expected the replace choice"),
+        }
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "old");
+        press(&mut app, 'y');
+        assert!(app.prompt.is_none());
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "hi\n");
+        assert!(!app.editor.buf.dirty);
+        assert_eq!(app.path.as_deref(), Some(p.as_path()));
+    }
+
+    #[test]
+    fn name_prompt_decline_keeps_file_and_dirty() {
+        let d = tempdir().unwrap();
+        let p = d.path().join("old.txt");
+        std::fs::write(&p, "old").unwrap();
+        let decline: [Event; 3] = [
+            key(KeyCode::Char('n'), KeyModifiers::NONE),
+            key(KeyCode::Esc, KeyModifiers::NONE),
+            key(KeyCode::Enter, KeyModifiers::NONE),
+        ];
+        for ev in decline {
+            let mut app = unnamed_with("hi");
+            app.dispatch(CommandId::Save);
+            submit_name(&mut app, &p);
+            app.handle_event(ev);
+            assert!(app.prompt.is_none());
+            assert_eq!(status(&app), "Not saved");
+            assert!(app.editor.buf.dirty);
+            assert!(app.path.is_none());
+            assert_eq!(std::fs::read_to_string(&p).unwrap(), "old");
+        }
+    }
+
+    #[test]
+    fn quit_yes_name_replace_yes_saves_and_quits() {
+        let d = tempdir().unwrap();
+        let p = d.path().join("old.txt");
+        std::fs::write(&p, "old").unwrap();
+        let mut app = unnamed_with("hi");
+        app.dispatch(CommandId::Quit);
+        press(&mut app, 'y');
+        submit_name(&mut app, &p);
+        assert!(!app.quit);
+        press(&mut app, 'y');
+        assert!(app.quit);
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "hi\n");
+    }
+
+    #[test]
+    fn name_prompt_existing_extensionless_not_renamed() {
+        let d = tempdir().unwrap();
+        let p = d.path().join("notes");
+        std::fs::write(&p, "old").unwrap();
+        let mut app = unnamed_with("hi");
+        app.dispatch(CommandId::Save);
+        submit_name(&mut app, &p);
+        press(&mut app, 'y');
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "hi\n");
+        assert!(!d.path().join("notes.txt").exists());
+        assert_eq!(app.path.as_deref(), Some(p.as_path()));
+    }
+
+    #[test]
+    fn name_prompt_new_extensionless_gets_txt() {
+        let d = tempdir().unwrap();
+        let mut app = unnamed_with("hi");
+        app.dispatch(CommandId::Save);
+        submit_name(&mut app, &d.path().join("todo"));
+        assert!(app.prompt.is_none());
+        let p = d.path().join("todo.txt");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "hi\n");
+        assert!(!d.path().join("todo").exists());
+    }
+
+    #[test]
+    fn name_prompt_trailing_separator_rejected() {
+        let d = tempdir().unwrap();
+        let sub = d.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let names = [
+            format!("{}/", sub.display()),
+            format!("{}\\", d.path().join("new").display()),
+            sub.display().to_string(),
+        ];
+        for name in names {
+            let mut app = unnamed_with("hi");
+            app.dispatch(CommandId::Save);
+            typ(&mut app, &name);
+            app.handle_event(key(KeyCode::Enter, KeyModifiers::NONE));
+            assert!(app.prompt.is_none(), "{name}");
+            assert_eq!(status(&app), "Not a file name", "{name}");
+            assert!(app.editor.buf.dirty);
+            assert!(app.path.is_none());
+        }
+        let left: Vec<_> = std::fs::read_dir(d.path()).unwrap().collect();
+        assert_eq!(left.len(), 1, "only sub/ remains");
+        assert_eq!(std::fs::read_dir(&sub).unwrap().count(), 0);
     }
 }

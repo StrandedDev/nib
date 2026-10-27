@@ -41,6 +41,8 @@ impl Prompt {
                         PromptResult::Pending
                     }
                 }
+                // Enter takes the safe default, same as Esc.
+                KeyCode::Enter => PromptResult::Cancel,
                 _ => PromptResult::Pending,
             },
             Prompt::Text { input, cursor, .. } => edit_text(input, cursor, key),
@@ -168,5 +170,14 @@ mod tests {
             p.handle_key(&key(KeyCode::Enter)),
             PromptResult::Submit("abcd".into())
         );
+    }
+
+    #[test]
+    fn choice_enter_cancels() {
+        let mut p = Prompt::Choice {
+            label: "Replace?".into(),
+            keys: &['y', 'n'],
+        };
+        assert_eq!(p.handle_key(&key(KeyCode::Enter)), PromptResult::Cancel);
     }
 }
