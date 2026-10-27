@@ -40,17 +40,19 @@ pub fn version_text() -> String {
 }
 
 pub fn help_text() -> &'static str {
-    "Usage: nib [FILE[:LINE]]
-     
-     A small terminal text editor.
-     
-     Options:
-       --help      Show this help
-       --version   Show the version
-       --          Treat the next argument as a file name
-     
-     A new file without an extension gets .txt appended.
-     It is created on first save."
+    concat!(
+        "Usage: nib [FILE[:LINE]]\n",
+        "\n",
+        "A small terminal text editor.\n",
+        "\n",
+        "Options:\n",
+        "  --help      Show this help\n",
+        "  --version   Show the version\n",
+        "  --          Treat the next argument as a file name\n",
+        "\n",
+        "A new file without an extension gets .txt appended.\n",
+        "It is created on first save."
+    )
 }
 
 pub fn resolve(raw: &str, exists: impl Fn(&Path) -> bool) -> (PathBuf, Option<usize>) {
@@ -219,5 +221,19 @@ mod tests {
                 line: None
             })
         );
+    }
+
+    #[test]
+    fn help_text_has_no_stray_indent() {
+        let mut indents = std::collections::HashSet::new();
+        for line in help_text().lines() {
+            assert_eq!(line, line.trim_end(), "trailing whitespace: {line:?}");
+            if line.starts_with(' ') {
+                assert!(line.contains("--"), "indented non-option row: {line:?}");
+                indents.insert(line.len() - line.trim_start().len());
+            }
+        }
+        assert_eq!(indents.len(), 1, "option rows differ in indent");
+        assert!(help_text().starts_with("Usage:"));
     }
 }
