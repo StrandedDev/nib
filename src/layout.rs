@@ -500,23 +500,26 @@ fn cursor_x(s: RopeSlice, vp: &Viewport, row_start: usize, cur: Pos) -> usize {
     }
 }
 
-/// Screen cell (x, y) of the cursor relative to the text area. Off-screen
-/// cursors report (0, 0); call `scroll_to_cursor` first.
-pub fn cursor_screen(rope: &Rope, vp: &Viewport, cur: Pos) -> (u16, u16) {
+/// Screen cell (x, y) of the cursor relative to the text area, or `None`
+/// when it is outside the window `visible_rows` shows.
+pub fn cursor_screen(rope: &Rope, vp: &Viewport, cur: Pos) -> Option<(u16, u16)> {
     let cur = clamp(rope, cur);
     let s = line_text(rope, cur.line);
     if !vp.wrap {
-        let y = cur.line.saturating_sub(vp.top.line);
-        let x = abs_x(s, vp, cur.line, cur.col).saturating_sub(vp.hscroll);
-        return (clamp_u16(x), clamp_u16(y));
+        let y = cur.line.checked_sub(vp.top.line)?;
+        let x = abs_x(s, vp, cur.line, cur.col).checked_sub(vp.hscroll)?;
+        if y >= usize::from(vp.height) || x >= usize::from(vp.width) {
+            return None;
+        }
+        return Some((clamp_u16(x), clamp_u16(y)));
     }
     for (y, row) in window(rope, vp).enumerate() {
         if row_holds(rope, vp, &row, cur) {
             let x = x_at(s, row.start_col, cur.col, vp.tab_width);
-            return (clamp_u16(x), clamp_u16(y));
+            return Some((clamp_u16(x), clamp_u16(y)));
         }
     }
-    (0, 0)
+    None
 }
 
 /// Buffer position under screen cell (x, y). Cells past the end of a row, or
@@ -841,8 +844,8 @@ mod tests {
         );
         let r = Rope::from_str("abcd");
         let v = vp(4, 5, true);
-        assert_eq!(cursor_screen(&r, &v, pos(0, 4)), (0, 1));
-        assert_eq!(cursor_screen(&r, &v, pos(0, 3)), (3, 0));
+        assert_eq!(cursor_screen(&r, &v, pos(0, 4)).unwrap(), (0, 1));
+        assert_eq!(cursor_screen(&r, &v, pos(0, 3)).unwrap(), (3, 0));
     }
 
     #[test]
@@ -907,9 +910,9 @@ mod tests {
     fn cursor_screen_in_wrapped_line() {
         let r = Rope::from_str("abcdefgh\nij");
         let v = vp(4, 5, true);
-        assert_eq!(cursor_screen(&r, &v, pos(0, 0)), (0, 0));
-        assert_eq!(cursor_screen(&r, &v, pos(0, 5)), (1, 1));
-        assert_eq!(cursor_screen(&r, &v, pos(1, 2)), (2, 3));
+        assert_eq!(cursor_screen(&r, &v, pos(0, 0)).unwrap(), (0, 0));
+        assert_eq!(cursor_screen(&r, &v, pos(0, 5)).unwrap(), (1, 1));
+        assert_eq!(cursor_screen(&r, &v, pos(1, 2)).unwrap(), (2, 3));
     }
 
     #[test]
@@ -918,7 +921,7 @@ mod tests {
         let mut v = vp(80, 24, true);
         v.top = row(0, 2_500_000, 0);
         let start = std::time::Instant::now();
-        let at = cursor_screen(&r, &v, pos(0, 2_500_000 + 80 * 3 + 7));
+        let at = cursor_screen(&r, &v, pos(0, 2_500_000 + 80 * 3 + 7)).unwrap();
         let elapsed = start.elapsed();
         assert_eq!(at, (7, 3));
         assert!(elapsed.as_millis() < 50, "{elapsed:?}");
@@ -935,7 +938,10 @@ mod tests {
                 let len = line_text(&r, line).len_chars();
                 for col in 0..=len {
                     let p = pos(line, col);
-                    let (x, y) = cursor_screen(&r, &v, p);
+                    let at = cursor_screen(&r, &v, p);
+                    // Unscrolled no-wrap columns past the width are off screen.
+                    assert!(!wrap || at.is_some(), "{p:?}");
+                    let Some((x, y)) = at else { continue };
                     assert_eq!(screen_to_pos(&r, &v, x, y), p, "wrap={wrap} {p:?}");
                 }
             }
@@ -1043,7 +1049,7 @@ mod tests {
         assert_eq!(v.top, Row::default(), "visible, unchanged");
         scroll_to_cursor(&r, &mut v, pos(4, 0), 0);
         assert_eq!(v.top.line, 2);
-        assert_eq!(cursor_screen(&r, &v, pos(4, 0)), (0, 2));
+        assert_eq!(cursor_screen(&r, &v, pos(4, 0)).unwrap(), (0, 2));
     }
 
     #[test]
@@ -1058,7 +1064,7 @@ mod tests {
         assert_eq!(v.top.line, 80);
         scroll_to_cursor(&r, &mut v, pos(10, 0), 0);
         assert_eq!(v.top.line, 10);
-        assert_eq!(cursor_screen(&r, &v, pos(10, 0)), (0, 0));
+        assert_eq!(cursor_screen(&r, &v, pos(10, 0)).unwrap(), (0, 0));
     }
 
     #[test]
@@ -1067,7 +1073,7 @@ mod tests {
         let mut v = vp(4, 2, true);
         scroll_to_cursor(&r, &mut v, pos(0, 9), 0);
         assert_eq!(v.top, row(0, 4, 8));
-        assert_eq!(cursor_screen(&r, &v, pos(0, 9)), (1, 1));
+        assert_eq!(cursor_screen(&r, &v, pos(0, 9)).unwrap(), (1, 1));
         scroll_to_cursor(&r, &mut v, pos(0, 1), 0);
         assert_eq!(v.top, row(0, 0, 4));
     }
@@ -1078,12 +1084,12 @@ mod tests {
         let mut v = vp(4, 2, false);
         scroll_to_cursor(&r, &mut v, pos(0, 6), 0);
         assert_eq!(v.hscroll, 3);
-        assert_eq!(cursor_screen(&r, &v, pos(0, 6)), (3, 0));
+        assert_eq!(cursor_screen(&r, &v, pos(0, 6)).unwrap(), (3, 0));
         scroll_to_cursor(&r, &mut v, pos(0, 1), 0);
         assert_eq!(v.hscroll, 1);
         scroll_to_cursor(&r, &mut v, pos(3, 0), 0);
         assert_eq!(v.top.line, 2);
-        assert_eq!(cursor_screen(&r, &v, pos(3, 0)), (0, 1));
+        assert_eq!(cursor_screen(&r, &v, pos(3, 0)).unwrap(), (0, 1));
     }
 
     #[test]
@@ -1133,7 +1139,7 @@ mod tests {
         let start = std::time::Instant::now();
         for _ in 0..1000 {
             scroll_to_cursor(&r, &mut v, cur, 0);
-            assert_eq!(cursor_screen(&r, &v, cur), (10, 0));
+            assert_eq!(cursor_screen(&r, &v, cur).unwrap(), (10, 0));
         }
         let elapsed = start.elapsed();
         assert_eq!(v.hscroll_col, 2_500_000);
@@ -1151,7 +1157,7 @@ mod tests {
         assert_eq!((v.hscroll, v.hscroll_col), (5, 5));
         // A new line keeps the display offset where the line is long enough.
         scroll_to_cursor(&r, &mut v, pos(2, 9), 0);
-        assert_eq!(cursor_screen(&r, &v, pos(2, 9)), (3, 2));
+        assert_eq!(cursor_screen(&r, &v, pos(2, 9)).unwrap(), (3, 2));
         assert_eq!(screen_to_pos(&r, &v, 3, 2), pos(2, 9));
     }
 
@@ -1195,7 +1201,7 @@ mod tests {
         let scratch = x_at(s, 0, 6, 4);
         assert_eq!(scratch, 6);
         assert_eq!(
-            usize::from(cursor_screen(&r, &v, pos(0, 6)).0),
+            usize::from(cursor_screen(&r, &v, pos(0, 6)).unwrap().0),
             scratch - v.hscroll
         );
         // The anchor line and another line agree on x for the same column.
@@ -1213,7 +1219,7 @@ mod tests {
         scroll_to_cursor(&r, &mut v, pos(0, 9), 0);
         let scratch = x_at(line_text(&r, 0), 0, 9, 8);
         assert_eq!(
-            usize::from(cursor_screen(&r, &v, pos(0, 9)).0),
+            usize::from(cursor_screen(&r, &v, pos(0, 9)).unwrap().0),
             scratch - v.hscroll
         );
     }
@@ -1227,7 +1233,7 @@ mod tests {
         r.insert(10, "z");
         scroll_to_cursor(&r, &mut v, pos(0, 11), 1);
         assert!(v.hscroll_col >= anchor.1);
-        assert_eq!(cursor_screen(&r, &v, pos(0, 11)).0, 3);
+        assert_eq!(cursor_screen(&r, &v, pos(0, 11)).unwrap().0, 3);
     }
 
     #[test]
@@ -1286,5 +1292,53 @@ mod tests {
             drawn(&rope, &vp),
             vec![vec![(1, 1, 1), (2, 2, 1), (3, 3, 1)]]
         );
+    }
+
+    #[test]
+    fn cursor_screen_none_when_above_top() {
+        let r = Rope::from_str("a\nb\nc\nd\nabcdefgh");
+        for wrap in [true, false] {
+            let mut v = vp(4, 2, wrap);
+            v.top = Row {
+                line: 2,
+                start_col: 0,
+                end_col: 1,
+            };
+            assert_eq!(cursor_screen(&r, &v, pos(0, 0)), None, "wrap={wrap}");
+            assert_eq!(cursor_screen(&r, &v, pos(1, 1)), None, "wrap={wrap}");
+            assert_eq!(
+                cursor_screen(&r, &v, pos(2, 0)),
+                Some((0, 0)),
+                "wrap={wrap}"
+            );
+        }
+        // Wrapped line scrolled past its first row.
+        let mut v = vp(4, 2, true);
+        v.top = row(4, 4, 8);
+        assert_eq!(cursor_screen(&r, &v, pos(4, 1)), None);
+        assert_eq!(cursor_screen(&r, &v, pos(4, 5)), Some((1, 0)));
+    }
+
+    #[test]
+    fn cursor_screen_none_when_below_window() {
+        let r = Rope::from_str("a\nb\nc\nd\nabcdefgh");
+        for wrap in [true, false] {
+            let v = vp(4, 2, wrap);
+            assert_eq!(
+                cursor_screen(&r, &v, pos(1, 0)),
+                Some((0, 1)),
+                "wrap={wrap}"
+            );
+            assert_eq!(cursor_screen(&r, &v, pos(2, 0)), None, "wrap={wrap}");
+            assert_eq!(cursor_screen(&r, &v, pos(4, 6)), None, "wrap={wrap}");
+        }
+        // No-wrap: x outside the horizontal window.
+        let mut v = vp(4, 5, false);
+        v.hscroll = 3;
+        v.hscroll_line = 4;
+        v.hscroll_col = 3;
+        assert_eq!(cursor_screen(&r, &v, pos(4, 1)), None);
+        assert_eq!(cursor_screen(&r, &v, pos(4, 8)), None);
+        assert_eq!(cursor_screen(&r, &v, pos(4, 5)), Some((2, 4)));
     }
 }

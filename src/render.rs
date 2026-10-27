@@ -84,9 +84,10 @@ pub fn draw(out: &mut impl Write, app: &AppView) -> io::Result<()> {
         cursor = draw_status(out, app, w, h - 1)?;
     }
     if cursor.is_none() && text_h > 0 {
-        let (x, y) = layout::cursor_screen(rope, app.viewport, app.editor.cursor);
-        if y < text_h {
-            cursor = Some((x.min(w - 1), y + 1));
+        if let Some((x, y)) = layout::cursor_screen(rope, app.viewport, app.editor.cursor) {
+            if y < text_h {
+                cursor = Some((x.min(w - 1), y + 1));
+            }
         }
     }
     if let Some((x, y)) = cursor {

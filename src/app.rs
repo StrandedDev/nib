@@ -770,7 +770,7 @@ mod tests {
         app.handle_event(Event::Resize(7, 5));
         assert_eq!(app.viewport.top.start_col % 7, 0, "{:?}", app.viewport.top);
         let e = &app.editor;
-        let (_, y) = layout::cursor_screen(&e.buf.rope, &app.viewport, e.cursor);
+        let (_, y) = layout::cursor_screen(&e.buf.rope, &app.viewport, e.cursor).unwrap();
         assert!(y < 3);
         for (w, h) in [(0, 0), (1, 1), (2, 2), (1, 3)] {
             app.handle_event(Event::Resize(w, h));
@@ -1058,5 +1058,36 @@ mod tests {
         }
         assert_eq!(app.viewport.top.line, 29);
         assert_eq!(app.editor.cursor, pos(0, 0));
+    }
+
+    fn cursor_cell(app: &App) -> Option<(u16, u16)> {
+        let e = &app.editor;
+        layout::cursor_screen(&e.buf.rope, &app.viewport, e.cursor)
+    }
+
+    fn long_doc() -> App {
+        let text = (0..30)
+            .map(|i| format!("l{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        doc(&text)
+    }
+
+    #[test]
+    fn wheel_past_cursor_hides_cursor() {
+        let mut app = long_doc();
+        let t = Instant::now();
+        assert_eq!(cursor_cell(&app), Some((0, 0)));
+        app.handle_mouse_at(mouse(MouseEventKind::ScrollDown, 0, 5), t);
+        assert_eq!(cursor_cell(&app), None);
+    }
+
+    #[test]
+    fn typing_after_wheel_brings_cursor_back() {
+        let mut app = long_doc();
+        app.handle_mouse_at(mouse(MouseEventKind::ScrollDown, 0, 5), Instant::now());
+        assert_eq!(cursor_cell(&app), None);
+        typ(&mut app, "x");
+        assert!(cursor_cell(&app).is_some());
     }
 }
