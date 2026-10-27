@@ -1,8 +1,10 @@
 pub mod app;
 pub mod buffer;
 pub mod cli;
+pub mod commands;
 pub mod cursor;
 pub mod edit;
 pub mod fileio;
+pub mod keymap;
 pub mod layout;
 pub mod terminal;
