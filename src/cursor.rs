@@ -30,12 +30,12 @@ fn classify(c: char) -> Class {
     }
 }
 
-fn last_line(rope: &Rope) -> usize {
+pub(crate) fn last_line(rope: &Rope) -> usize {
     rope.len_lines() - 1
 }
 
 /// The line's text without its trailing `\n`.
-fn line_text(rope: &Rope, line: usize) -> RopeSlice<'_> {
+pub(crate) fn line_text(rope: &Rope, line: usize) -> RopeSlice<'_> {
     let s = rope.line(line);
     let n = s.len_chars();
     if n > 0 && s.char(n - 1) == '\n' {
@@ -89,11 +89,11 @@ fn prev_boundary(s: RopeSlice, byte: usize) -> usize {
     }
 }
 
-fn next_col(s: RopeSlice, col: usize) -> usize {
+pub(crate) fn next_col(s: RopeSlice, col: usize) -> usize {
     s.byte_to_char(next_boundary(s, s.char_to_byte(col)))
 }
 
-fn prev_col(s: RopeSlice, col: usize) -> usize {
+pub(crate) fn prev_col(s: RopeSlice, col: usize) -> usize {
     s.byte_to_char(prev_boundary(s, s.char_to_byte(col)))
 }
 

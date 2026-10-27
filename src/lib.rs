@@ -4,4 +4,5 @@ pub mod cli;
 pub mod cursor;
 pub mod edit;
 pub mod fileio;
+pub mod layout;
 pub mod terminal;
