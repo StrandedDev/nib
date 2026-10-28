@@ -16,6 +16,7 @@ use crate::commands::CommandId;
 use crate::cursor::{self, Pos};
 use crate::edit::Editor;
 use crate::fileio::{self, Loaded};
+use crate::find::FindSession;
 use crate::indent::{self, Indent};
 use crate::keymap::Keymap;
 use crate::layout::{self, Viewport};
@@ -35,6 +36,7 @@ pub struct App {
     disk_mtime: Option<SystemTime>,
     read_only: bool,
     prompt: Option<(Prompt, PromptPurpose)>,
+    find: Option<FindSession>,
     status: Option<(String, Instant)>,
     /// Time and cell of the last left-button press, for double-click.
     last_click: Option<(Instant, u16, u16)>,
@@ -140,7 +142,9 @@ impl App {
                 .map_or("[No Name]".to_string(), file_name),
             state: title_state(self),
             status: self.status_text(),
-            prompt: self.prompt.as_ref().map(|(p, _)| p),
+            prompt: (self.find.as_ref().map(FindSession::prompt))
+                .or(self.prompt.as_ref().map(|(p, _)| p)),
+            find: self.find.as_ref(),
         }
     }
 
@@ -199,6 +203,9 @@ impl App {
                 }
                 // Text left of a no-wrap anchor may have changed under the cursor.
                 self.viewport.invalidate();
+            }
+            C::Find | C::Replace => {
+                self.find = Some(FindSession::new(&self.editor, id == C::Replace))
             }
             C::Quit => self.quit(),
             C::Copy => self.copy(),
@@ -346,6 +353,32 @@ impl App {
         }
     }
 
+    /// Routes a key to the open find/replace session and applies its outcome.
+    fn find_key(&mut self, key: &KeyEvent) {
+        let bound = self.keymap.lookup(key);
+        let Some(f) = &mut self.find else {
+            return;
+        };
+        let out = f.handle_key(key, bound.is_some(), &mut self.editor);
+        if out.edited {
+            // Text left of a no-wrap anchor may have changed under the cursor.
+            self.viewport.invalidate();
+        }
+        if out.close {
+            self.find = None;
+        }
+        self.status_from(out.status);
+        if let (true, Some(id)) = (out.forward, bound) {
+            self.dispatch(id);
+        }
+    }
+
+    fn status_from(&mut self, status: Option<String>) {
+        if let Some(msg) = status {
+            self.set_status(&msg);
+        }
+    }
+
     /// First save under a typed name. An existing target is only replaced
     /// after a yes.
     fn save_named(&mut self, name: &str, then_quit: bool) {
@@ -383,7 +416,9 @@ impl App {
     pub(crate) fn handle_event(&mut self, ev: Event) {
         match ev {
             Event::Key(key) if key.kind != KeyEventKind::Release => {
-                if self.prompt.is_some() {
+                if self.find.is_some() {
+                    self.find_key(&key);
+                } else if self.prompt.is_some() {
                     self.prompt_key(&key);
                 } else if let Some(id) = self.keymap.lookup(&key) {
                     self.dispatch(id);
@@ -405,9 +440,13 @@ impl App {
                     end_col: 0,
                 };
             }
-            Event::Paste(s) => match &mut self.prompt {
-                Some((p, _)) => p.paste(&s),
-                None => self.editor.insert_str(&normalise_paste(&s)),
+            Event::Paste(s) => match (&mut self.find, &mut self.prompt) {
+                (Some(f), _) => {
+                    let out = f.paste(&s, &mut self.editor);
+                    self.status_from(out.status);
+                }
+                (None, Some((p, _))) => p.paste(&s),
+                (None, None) => self.editor.insert_str(&normalise_paste(&s)),
             },
             Event::Mouse(m) => {
                 self.handle_mouse_at(m, Instant::now());
@@ -421,7 +460,7 @@ impl App {
 
     /// Mouse handling with an explicit clock, so double-click timing is testable.
     fn handle_mouse_at(&mut self, m: MouseEvent, now: Instant) {
-        if self.prompt.is_some() {
+        if self.prompt.is_some() || self.find.is_some() {
             return;
         }
         // The text area sits between the title row and the status row.
@@ -479,6 +518,7 @@ impl App {
             disk_mtime: None,
             read_only: false,
             prompt: None,
+            find: None,
             status: None,
             last_click: None,
             clip: Box::new(Osc52::default()),
@@ -778,7 +818,7 @@ mod tests {
         ));
         app.handle_event(key(KeyCode::Char('Z'), KeyModifiers::SHIFT));
         assert_eq!(app.editor.buf.rope.to_string(), "ab\nd@Z");
-        app.handle_event(key(KeyCode::Char('f'), KeyModifiers::CONTROL));
+        app.handle_event(key(KeyCode::Char('g'), KeyModifiers::CONTROL));
         assert_eq!(status(&app), "Not available yet");
         app.handle_event(Event::Paste("1\r\n2".into()));
         assert_eq!(app.editor.buf.rope.to_string(), "ab\nd@Z1\n2");
@@ -849,7 +889,7 @@ mod tests {
     #[test]
     fn status_fades_after_four_seconds() {
         let mut app = App::from_buffer(Buffer::new_empty(LineEnding::Lf), None);
-        app.dispatch(CommandId::Find);
+        app.dispatch(CommandId::GotoLine);
         let t0 = app.status.as_ref().unwrap().1;
         let at = |s| t0 + Duration::from_millis(s);
         assert!(!app.expire_status(at(3999)));
@@ -1348,5 +1388,45 @@ three"
         typ(&mut app, "- a");
         app.handle_event(key(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(app.editor.buf.rope.to_string(), "    - a\n    - ");
+    }
+
+    fn ctrl(c: char) -> Event {
+        key(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn find_selects_then_other_command_keeps_match() {
+        let mut app = App::from_buffer(Buffer::from_str_detect("one two three"), None);
+        app.handle_event(ctrl('f'));
+        assert!(app.find.is_some());
+        typ(&mut app, "two");
+        assert_eq!(app.editor.selection(), Some(4..7));
+        // A bound command closes the prompt and then runs.
+        app.handle_event(key(KeyCode::End, KeyModifiers::NONE));
+        assert!(app.find.is_none());
+        assert_eq!(app.editor.cursor, Pos { line: 0, col: 13 });
+        // Esc closes and restores.
+        app.handle_event(ctrl('f'));
+        typ(&mut app, "one");
+        app.handle_event(key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.find.is_none());
+        assert_eq!(app.editor.cursor, Pos { line: 0, col: 13 });
+    }
+
+    #[test]
+    fn replace_invalidates_viewport() {
+        let mut app = App::from_buffer(Buffer::from_str_detect("ab ab"), None);
+        app.handle_event(ctrl('r'));
+        typ(&mut app, "ab");
+        app.handle_event(key(KeyCode::Enter, KeyModifiers::NONE));
+        typ(&mut app, "ZZZ");
+        app.handle_event(key(KeyCode::Enter, KeyModifiers::NONE));
+        // Pretend a no-wrap anchor was computed before the edit.
+        let vp = &mut app.viewport;
+        (vp.hscroll, vp.hscroll_col, vp.hscroll_line) = (7, 7, 0);
+        app.find_key(&KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert_eq!(app.editor.buf.rope.to_string(), "ZZZ ab");
+        let vp = &app.viewport;
+        assert_eq!((vp.hscroll, vp.hscroll_col, vp.hscroll_line), (0, 0, 0));
     }
 }

@@ -64,6 +64,18 @@ impl UndoStack {
         self.last_at = Some(now);
     }
 
+    /// Adds `edit` to the group the last `push` made, so a multi-range
+    /// change undoes as one step.
+    pub fn push_joined(&mut self, edit: Edit, now: Instant) {
+        match self.applied.checked_sub(1) {
+            Some(i) => {
+                self.groups[i].edits.push(edit);
+                self.last_at = Some(now);
+            }
+            None => self.push(edit, EditKind::Other, now),
+        }
+    }
+
     fn can_merge(&self, edit: &Edit, kind: EditKind, now: Instant) -> bool {
         let Some(group) = self.applied.checked_sub(1).map(|i| &self.groups[i]) else {
             return false;

@@ -261,8 +261,30 @@ impl Editor {
     /// cursor after `s`, drops the anchor, and records the change for undo.
     /// Empty-for-empty is a no-op.
     fn replace_range(&mut self, range: Range<usize>, s: &str, kind: EditKind) {
+        if let Some(edit) = self.apply(range, s) {
+            let now = self.now.unwrap_or_else(Instant::now);
+            self.undo.push(edit, kind, now);
+        }
+    }
+
+    /// Replaces each of `ranges` (ascending, not overlapping) with `s` as
+    /// one undo step. Applied back to front so earlier offsets stay valid.
+    pub fn replace_many(&mut self, ranges: &[Range<usize>], s: &str) {
+        let mut last = true;
+        for r in ranges.iter().rev() {
+            if last {
+                self.replace_range(r.clone(), s, EditKind::Other);
+                last = false;
+            } else if let Some(edit) = self.apply(r.clone(), s) {
+                let now = self.now.unwrap_or_else(Instant::now);
+                self.undo.push_joined(edit, now);
+            }
+        }
+    }
+
+    fn apply(&mut self, range: Range<usize>, s: &str) -> Option<Edit> {
         if range.start >= range.end && s.is_empty() {
-            return;
+            return None;
         }
         let at = range.start;
         let cursor_before = self.cursor;
@@ -276,15 +298,13 @@ impl Editor {
         self.cursor = cursor::from_char_idx(&self.buf.rope, at + s.chars().count());
         self.anchor = None;
         self.preferred_col = None;
-        let edit = Edit {
+        Some(Edit {
             at,
             removed,
             inserted: s.to_string(),
             cursor_before,
             cursor_after: self.cursor,
-        };
-        let now = self.now.unwrap_or_else(Instant::now);
-        self.undo.push(edit, kind, now);
+        })
     }
 }
 
@@ -785,5 +805,19 @@ ef"
         e.tab();
         assert_eq!(text(&e), "a    ef");
         assert_eq!(e.cursor, pos(0, 5));
+    }
+
+    #[test]
+    fn replace_many_is_one_undo_step() {
+        let mut e = ed("a b a b a");
+        e.replace_many(&[0..1, 4..5, 8..9], "xyz");
+        assert_eq!(text(&e), "xyz b xyz b xyz");
+        e.undo();
+        assert_eq!(text(&e), "a b a b a");
+        e.redo();
+        assert_eq!(text(&e), "xyz b xyz b xyz");
+        e.undo();
+        assert_eq!(text(&e), "a b a b a");
+        assert!(!e.buf.dirty);
     }
 }

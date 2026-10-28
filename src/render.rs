@@ -3,6 +3,7 @@
 
 use std::fmt;
 use std::io::{self, Write};
+use std::ops::Range;
 
 use crossterm::{
     Command,
@@ -17,6 +18,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::cli;
 use crate::cursor::{Pos, from_char_idx, line_text};
 use crate::edit::Editor;
+use crate::find::FindSession;
 use crate::layout::{self, Row, Viewport};
 use crate::prompt::Prompt;
 
@@ -48,6 +50,8 @@ pub struct AppView<'a> {
     pub state: String,
     pub status: Option<&'a str>,
     pub prompt: Option<&'a Prompt>,
+    /// The open find/replace session: its matches are underlined.
+    pub find: Option<&'a FindSession>,
 }
 
 pub fn draw(out: &mut impl Write, app: &AppView) -> io::Result<()> {
@@ -68,10 +72,18 @@ pub fn draw(out: &mut impl Write, app: &AppView) -> io::Result<()> {
     let text_h = h.saturating_sub(2);
     let rope = &app.editor.buf.rope;
     let rows = layout::visible_rows(rope, app.viewport);
+    let marks = match (app.find, rows.first(), rows.last()) {
+        (Some(f), Some(a), Some(b)) => {
+            let seen =
+                rope.line_to_char(a.line) + a.start_col..rope.line_to_char(b.line) + b.end_col;
+            f.visible_matches(rope, seen)
+        }
+        _ => Vec::new(),
+    };
     for y in 0..text_h {
         queue!(out, MoveTo(0, y + 1))?;
         let used = match rows.get(usize::from(y)) {
-            Some(row) => draw_row(out, app, row)?,
+            Some(row) => draw_row(out, app, row, &marks)?,
             None => 0,
         };
         if used < usize::from(w) {
@@ -96,24 +108,32 @@ pub fn draw(out: &mut impl Write, app: &AppView) -> io::Result<()> {
     out.flush()
 }
 
-/// Switches reverse video on or off, writing only on a change.
-fn set_reverse(out: &mut impl Write, state: &mut bool, want: bool) -> io::Result<()> {
+/// Switches an attribute on or off, writing only on a change.
+fn set_attr(
+    out: &mut impl Write,
+    state: &mut bool,
+    want: bool,
+    (on, off): (Attribute, Attribute),
+) -> io::Result<()> {
     if *state != want {
-        let attr = if want {
-            Attribute::Reverse
-        } else {
-            Attribute::NoReverse
-        };
-        queue!(out, SetAttribute(attr))?;
+        queue!(out, SetAttribute(if want { on } else { off }))?;
         *state = want;
     }
     Ok(())
 }
 
+const REVERSE: (Attribute, Attribute) = (Attribute::Reverse, Attribute::NoReverse);
+const UNDERLINE: (Attribute, Attribute) = (Attribute::Underlined, Attribute::NoUnderline);
+
 /// Draws one text row from the cursor's current position. Returns the
 /// number of cells written. Selected cells, and the line end when its
 /// newline is selected, are drawn in reverse video.
-fn draw_row(out: &mut impl Write, app: &AppView, row: &Row) -> io::Result<usize> {
+fn draw_row(
+    out: &mut impl Write,
+    app: &AppView,
+    row: &Row,
+    marks: &[Range<usize>],
+) -> io::Result<usize> {
     let rope = &app.editor.buf.rope;
     let s = line_text(rope, row.line);
     let sel = app
@@ -127,15 +147,24 @@ fn draw_row(out: &mut impl Write, app: &AppView, row: &Row) -> io::Result<usize>
         };
         sel.is_some_and(|(a, b)| a <= p && p < b)
     };
-    let mut rev = false;
+    let base = rope.line_to_char(row.line);
+    // `marks` are sorted and do not overlap.
+    let marked = |col: usize| {
+        let i = base + col;
+        let k = marks.partition_point(|m| m.end <= i);
+        marks.get(k).is_some_and(|m| m.start <= i)
+    };
+    let (mut rev, mut under) = (false, false);
     let mut x = 0;
     for c in layout::draw_cells(rope, app.viewport, row) {
         if c.x > x {
-            set_reverse(out, &mut rev, false)?;
+            set_attr(out, &mut rev, false, REVERSE)?;
+            set_attr(out, &mut under, false, UNDERLINE)?;
             queue!(out, Print(" ".repeat(c.x - x)))?;
         }
         x = c.x + c.w;
-        set_reverse(out, &mut rev, selected(c.start))?;
+        set_attr(out, &mut rev, selected(c.start), REVERSE)?;
+        set_attr(out, &mut under, marked(c.start), UNDERLINE)?;
         let g = s.slice(c.start..c.end);
         if g.char(0) == '\t' {
             queue!(out, Print(" ".repeat(c.w)))?;
@@ -157,11 +186,13 @@ fn draw_row(out: &mut impl Write, app: &AppView, row: &Row) -> io::Result<usize>
     }
     let len = s.len_chars();
     if row.end_col == len && x < usize::from(app.viewport.width) && selected(len) {
-        set_reverse(out, &mut rev, true)?;
+        set_attr(out, &mut rev, true, REVERSE)?;
+        set_attr(out, &mut under, false, UNDERLINE)?;
         queue!(out, Print(' '))?;
         x += 1;
     }
-    set_reverse(out, &mut rev, false)?;
+    set_attr(out, &mut rev, false, REVERSE)?;
+    set_attr(out, &mut under, false, UNDERLINE)?;
     Ok(x)
 }
 
@@ -324,6 +355,7 @@ mod tests {
             state: String::new(),
             status: None,
             prompt: None,
+            find: None,
         };
         let mut out = Vec::new();
         draw(&mut out, &view).unwrap();
@@ -355,5 +387,33 @@ mod tests {
         let f = frame("abcdefgh", 4, (pos(0, 2), pos(0, 6)));
         assert!(f.contains("ab\u{1b}[7mcd\u{1b}[27m"), "{f:?}");
         assert!(f.contains("\u{1b}[7mef\u{1b}[27mgh"), "{f:?}");
+    }
+
+    #[test]
+    fn find_matches_underlined_current_match_reversed() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut e = Editor::new(crate::buffer::Buffer::from_str_detect("ab cd ab"));
+        let mut f = FindSession::new(&e, false);
+        for c in ['a', 'b'] {
+            let k = KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+            f.handle_key(&k, false, &mut e);
+        }
+        let vp = Viewport::new(20, 6, true, 4);
+        let view = AppView {
+            editor: &e,
+            viewport: &vp,
+            screen: (20, 8),
+            name: String::new(),
+            state: String::new(),
+            status: None,
+            prompt: Some(f.prompt()),
+            find: Some(&f),
+        };
+        let mut out = Vec::new();
+        draw(&mut out, &view).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        // The current match is selected and underlined; the other only underlined.
+        assert!(out.contains("\u{1b}[7m\u{1b}[4mab\u{1b}[27m"), "{out:?}");
+        assert!(out.contains("\u{1b}[4mab\u{1b}[24m"), "{out:?}");
     }
 }
