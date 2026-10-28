@@ -8,6 +8,7 @@ use crossterm::event::{
     MouseEventKind,
 };
 use crossterm::terminal;
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::buffer::{Buffer, LineEnding};
 use crate::clipboard::{Clip, Osc52};
@@ -228,7 +229,10 @@ impl App {
             C::SelDown => self.vertical(1, true),
             C::PageUp => self.vertical(-page, false),
             C::PageDown => self.vertical(page, false),
-            C::SelectAll => self.editor.select_all(),
+            C::SelectAll => {
+                self.editor.select_all();
+                self.set_status("Selected all");
+            }
             C::Backspace => self.editor.backspace(),
             C::Delete => self.editor.delete(),
             C::DeleteWordBack => self.editor.delete_word_back(),
@@ -236,11 +240,18 @@ impl App {
             C::Newline => self.editor.newline(),
             C::Tab => self.editor.tab(),
             C::Undo | C::Redo => {
-                if id == C::Undo {
-                    self.editor.undo();
+                let msg = if id == C::Undo {
+                    if self.editor.undo() {
+                        "Undo"
+                    } else {
+                        "Nothing to undo"
+                    }
+                } else if self.editor.redo() {
+                    "Redo"
                 } else {
-                    self.editor.redo();
-                }
+                    "Nothing to redo"
+                };
+                self.set_status(msg);
                 // Text left of a no-wrap anchor may have changed under the cursor.
                 self.viewport.invalidate();
             }
@@ -259,10 +270,12 @@ impl App {
             C::ToggleLineNumbers => {
                 self.line_numbers = !self.line_numbers;
                 self.fit_width();
+                self.set_status(&on_off("Line numbers", self.line_numbers));
             }
             C::ToggleWrap => {
                 self.viewport.wrap = !self.viewport.wrap;
                 self.relayout();
+                self.set_status(&on_off("Wrap", self.viewport.wrap));
             }
             C::GotoLine => self.prompt = Some((Prompt::text("Line: "), PromptPurpose::GotoLine)),
             C::Palette => self.palette = Some(Palette::default()),
@@ -321,27 +334,35 @@ impl App {
 
     fn copy(&mut self) {
         match self.editor.selected_text() {
-            Some(text) => self.clip_set(&text),
+            Some(text) => self.clip_set(&text, "Copied"),
             None => self.set_status("Nothing selected"),
         }
     }
 
     fn cut(&mut self) {
         let text = self.editor.cut();
-        self.clip_set(&text);
+        self.clip_set(&text, "Cut");
     }
 
     // Many terminals intercept Ctrl+V and send a bracketed paste instead.
     fn paste(&mut self) {
-        if let Some(text) = self.clip.get() {
-            self.editor.insert_str(&text); // normalises CRLF
+        match self.clip.get().filter(|t| !t.is_empty()) {
+            Some(text) => {
+                self.editor.insert_str(&text); // normalises CRLF
+                let text = text.replace("\r\n", "\n");
+                self.set_status(&format!("Pasted {}", amount(&text)));
+            }
+            None => self.set_status("Nothing to paste"),
         }
     }
 
-    fn clip_set(&mut self, text: &str) {
+    /// Puts `text` on the clipboard and says so with `verb`, unless the
+    /// clipboard has a notice of its own.
+    fn clip_set(&mut self, text: &str, verb: &str) {
         self.clip.set(text);
-        if let Some(msg) = self.clip.take_notice() {
-            self.set_status(msg);
+        match self.clip.take_notice() {
+            Some(msg) => self.set_status(msg),
+            None => self.set_status(&format!("{verb} {}", amount(text))),
         }
     }
 
@@ -578,6 +599,23 @@ impl App {
     }
 }
 
+/// The message for a toggle: `<what> on` or `<what> off`.
+fn on_off(what: &str, on: bool) -> String {
+    format!("{what} {}", if on { "on" } else { "off" })
+}
+
+/// How much text a clipboard command moved: whole lines when it spans a
+/// line break, else characters (grapheme clusters).
+fn amount(text: &str) -> String {
+    let plural = |n: usize, unit: &str| format!("{n} {unit}{}", if n == 1 { "" } else { "s" });
+    let breaks = text.matches('\n').count();
+    if breaks == 0 {
+        plural(text.graphemes(true).count(), "char")
+    } else {
+        plural(breaks + usize::from(!text.ends_with('\n')), "line")
+    }
+}
+
 /// Bracketed paste can send `\r` for newlines; pasted text only.
 fn normalise_paste(s: &str) -> String {
     s.replace("\r\n", "\n").replace('\r', "\n")
@@ -781,6 +819,62 @@ mod tests {
         assert!(app.expire_status(at(4000)));
         assert_eq!(app.status_text(), None);
         assert!(!app.expire_status(at(5000)));
+    }
+
+    /// The frame the app would draw now.
+    fn frame(app: &App) -> String {
+        let mut out = Vec::new();
+        render::draw(&mut out, &app.view()).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn message_box_fades_after_four_seconds() {
+        let mut app = doc("abc");
+        app.handle_event(Event::Resize(40, 10));
+        app.dispatch(CommandId::SelectAll);
+        let t0 = app.status.as_ref().unwrap().1;
+        let f = frame(&app);
+        // 16 wide, ending one column in from the right edge.
+        assert!(
+            f.contains("\u{1b}[8;24H\u{1b}[90m\u{2502}\u{1b}[39m Selected all "),
+            "{f:?}"
+        );
+        // A key press does not dismiss it.
+        app.handle_event(key(KeyCode::Right, KeyModifiers::NONE));
+        assert!(frame(&app).contains(" Selected all "));
+        app.expire_status(t0 + Duration::from_millis(3999));
+        assert!(frame(&app).contains(" Selected all "));
+        app.expire_status(t0 + Duration::from_millis(4000));
+        let f = frame(&app);
+        assert!(
+            !f.contains('\u{250c}') && !f.contains("Selected all"),
+            "{f:?}"
+        );
+    }
+
+    #[test]
+    fn errors_show_in_the_box_and_a_new_message_replaces_the_old() {
+        let mut app = doc("ab ab");
+        app.handle_event(Event::Resize(40, 10));
+        search(&mut app, "zz");
+        app.dispatch(CommandId::FindNext);
+        let f = frame(&app);
+        assert!(
+            f.contains("\u{1b}[8;27H\u{1b}[90m\u{2502}\u{1b}[39m Not found "),
+            "{f:?}"
+        );
+        let t0 = app.status.as_ref().unwrap().1;
+        std::thread::sleep(Duration::from_millis(5));
+        app.dispatch(CommandId::Copy);
+        let t1 = app.status.as_ref().unwrap().1;
+        assert!(t1 > t0);
+        let f = frame(&app);
+        assert!(!f.contains("Not found"), "{f:?}");
+        assert!(f.contains(" Nothing selected "), "{f:?}");
+        // The timer restarted: still there 4 s after the first message.
+        app.expire_status(t0 + Duration::from_millis(4000));
+        assert!(frame(&app).contains(" Nothing selected "));
     }
 
     #[test]
@@ -989,7 +1083,7 @@ mod tests {
         app.dispatch(CommandId::Copy);
         assert_eq!(fake.0.borrow().as_deref(), Some("hello "));
         assert_eq!(app.editor.buf.rope.to_string(), "hello world");
-        assert_eq!(app.status_text(), None);
+        assert_eq!(app.status_text(), Some("Copied 6 chars"));
     }
 
     #[test]
@@ -1007,7 +1101,7 @@ mod tests {
         app.dispatch(CommandId::Cut);
         assert_eq!(fake.0.borrow().as_deref(), Some("ab\n"));
         assert_eq!(app.editor.buf.rope.to_string(), "cd");
-        assert_eq!(app.status_text(), None);
+        assert_eq!(app.status_text(), Some("Cut 1 line"));
     }
 
     #[test]
@@ -1387,6 +1481,115 @@ three"
         assert_eq!(status(&app), "No previous search");
         app.dispatch(CommandId::FindPrev);
         assert_eq!(status(&app), "No previous search");
+    }
+
+    #[test]
+    fn save_and_save_as_announce_the_name() {
+        let d = tempdir().unwrap();
+        let (_, mut app) = existing(&d, "abc\n");
+        typ(&mut app, "x");
+        app.dispatch(CommandId::Save);
+        assert_eq!(status(&app), "Saved a.txt");
+        app.dispatch(CommandId::SaveAs);
+        // Clear the prefilled name, then type a new one.
+        for _ in 0..500 {
+            app.handle_event(key(KeyCode::Backspace, KeyModifiers::NONE));
+        }
+        submit_name(&mut app, &d.path().join("notes.md"));
+        assert_eq!(status(&app), "Saved notes.md");
+    }
+
+    fn open_named(app: &mut App, p: &std::path::Path) {
+        app.dispatch(CommandId::Open);
+        submit_name(app, p);
+    }
+
+    #[test]
+    fn open_announces_the_file_but_startup_does_not() {
+        let d = tempdir().unwrap();
+        let (_, mut app) = existing(&d, "abc\n");
+        assert_eq!(status(&app), "");
+        std::fs::write(d.path().join("todo.txt"), "x\n").unwrap();
+        open_named(&mut app, &d.path().join("todo.txt"));
+        assert_eq!(status(&app), "Opened todo.txt");
+        open_named(&mut app, &d.path().join("fresh.md"));
+        assert_eq!(status(&app), "New file fresh.md");
+    }
+
+    #[test]
+    fn clipboard_commands_announce_what_they_moved() {
+        let (mut app, fake) = clip_app("hello world\nsecond\nthird");
+        app.editor.move_to(pos(0, 5), true);
+        app.dispatch(CommandId::Copy);
+        assert_eq!(status(&app), "Copied 5 chars");
+        app.editor.move_to(pos(0, 0), false);
+        app.editor.move_to(pos(0, 1), true);
+        app.dispatch(CommandId::Copy);
+        assert_eq!(status(&app), "Copied 1 char");
+        app.editor.move_to(pos(2, 2), true);
+        app.dispatch(CommandId::Copy);
+        assert_eq!(status(&app), "Copied 3 lines");
+        app.editor.move_to(pos(1, 0), true);
+        app.dispatch(CommandId::Copy);
+        assert_eq!(status(&app), "Copied 1 line");
+        // Cut with no selection takes the whole line.
+        app.editor.move_to(pos(1, 2), false);
+        app.dispatch(CommandId::Cut);
+        assert_eq!(status(&app), "Cut 1 line");
+        app.editor.move_to(pos(0, 6), false);
+        app.editor.move_to(pos(0, 11), true);
+        app.dispatch(CommandId::Cut);
+        assert_eq!(status(&app), "Cut 5 chars");
+        app.dispatch(CommandId::Paste);
+        assert_eq!(status(&app), "Pasted 5 chars");
+        *fake.0.borrow_mut() = Some("a\r\nb\r\n".into());
+        app.dispatch(CommandId::Paste);
+        assert_eq!(status(&app), "Pasted 2 lines");
+        *fake.0.borrow_mut() = Some(String::new());
+        app.dispatch(CommandId::Paste);
+        assert_eq!(status(&app), "Nothing to paste");
+        assert_eq!(app.editor.buf.rope.to_string(), "hello worlda\nb\n\nthird");
+    }
+
+    #[test]
+    fn undo_and_redo_announce_themselves() {
+        let mut app = doc("");
+        app.dispatch(CommandId::Undo);
+        assert_eq!(status(&app), "Nothing to undo");
+        app.dispatch(CommandId::Redo);
+        assert_eq!(status(&app), "Nothing to redo");
+        typ(&mut app, "x");
+        app.dispatch(CommandId::Undo);
+        assert_eq!(status(&app), "Undo");
+        app.dispatch(CommandId::Redo);
+        assert_eq!(status(&app), "Redo");
+        assert_eq!(app.editor.buf.rope.to_string(), "x");
+    }
+
+    #[test]
+    fn toggles_and_select_all_announce_themselves() {
+        let mut app = doc("abc");
+        app.dispatch(CommandId::ToggleWrap);
+        assert_eq!(status(&app), "Wrap off");
+        app.dispatch(CommandId::ToggleWrap);
+        assert_eq!(status(&app), "Wrap on");
+        app.dispatch(CommandId::ToggleLineNumbers);
+        assert_eq!(status(&app), "Line numbers on");
+        app.dispatch(CommandId::ToggleLineNumbers);
+        assert_eq!(status(&app), "Line numbers off");
+        app.dispatch(CommandId::SelectAll);
+        assert_eq!(status(&app), "Selected all");
+    }
+
+    #[test]
+    fn typing_and_movement_are_not_announced() {
+        let mut app = doc("ab\ncd");
+        typ(&mut app, "x");
+        app.dispatch(CommandId::Down);
+        app.dispatch(CommandId::SelRight);
+        app.dispatch(CommandId::Tab);
+        app.dispatch(CommandId::Backspace);
+        assert_eq!(status(&app), "");
     }
 
     #[test]

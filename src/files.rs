@@ -153,7 +153,10 @@ impl App {
             startup,
         };
         match check {
-            Check::Clear => self.replace_buffer(buf, is_new, pending.path, line, false),
+            Check::Clear => {
+                self.replace_buffer(buf, is_new, pending.path, line, false);
+                self.announce_open(startup);
+            }
             Check::Owned(pid) => {
                 let p = Prompt::Choice {
                     label: format!(
@@ -210,6 +213,17 @@ impl App {
             let last = self.editor.buf.rope.len_lines() - 1;
             let line = n.saturating_sub(1).min(last);
             self.editor.move_to(Pos { line, col: 0 }, false);
+        }
+    }
+
+    /// Says which file Open loaded. At startup the title bar is enough.
+    fn announce_open(&mut self, startup: bool) {
+        let Some(path) = &self.path else {
+            return;
+        };
+        if !startup {
+            let what = if self.is_new { "New file" } else { "Opened" };
+            self.set_status(&format!("{what} {}", file_name(path)));
         }
     }
 
@@ -304,6 +318,7 @@ impl App {
         self.disk_mtime = fileio::mtime(&path);
         self.read_only = shared || !fileio::is_writable(&path);
         self.is_new = false;
+        self.set_status(&format!("Saved {}", file_name(&path)));
         self.path = Some(path);
         true
     }
@@ -371,6 +386,7 @@ impl App {
             (FileFlow::ReadOnly(o), PromptResult::Choice('y')) => {
                 if let Some((buf, is_new)) = self.reread(&o.path) {
                     self.replace_buffer(buf, is_new, o.path, o.line, true);
+                    self.announce_open(o.startup);
                 }
             }
             (FileFlow::Recover(o), PromptResult::Choice('y')) => {
@@ -385,6 +401,7 @@ impl App {
                     }
                     None => self.replace_buffer(disk, is_new, o.path, o.line, false),
                 }
+                self.announce_open(o.startup);
             }
             (FileFlow::Recover(o), PromptResult::Choice('n')) => {
                 match self.recovery.decline(&o.path) {
@@ -1419,7 +1436,7 @@ mod tests {
         }
         typ(&mut app, "x");
         app.dispatch(CommandId::Save);
-        assert_eq!(status(&app), "");
+        assert_eq!(status(&app), "Saved ro.txt");
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "xabc\n");
         assert!(!app.read_only && !app.editor.buf.dirty);
         assert!(!title_state(&app).contains("[Read-only]"));

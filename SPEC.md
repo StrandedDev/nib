@@ -19,9 +19,10 @@ regex search · multiple buffers/tabs · block selection · multiple cursors · 
 ```
  nib 0.1.0                    todo.md                    2026-10-27 14:02
  <text area>
-
-
- <status line — blank unless there is a message>
+                                                        ┌───────────────┐
+                                                        │ Saved todo.md │
+                                                        └───────────────┘
+ <status line — prompts; blank otherwise>
 ```
 
 - **Title bar** (nano layout): `nib <version>` left · file name centre · state right.
@@ -35,7 +36,26 @@ regex search · multiple buffers/tabs · block selection · multiple cursors · 
   right-aligned in dark grey on the first row of each line (wrapped continuation rows get a blank
   gutter); the text gets the rest of the width. A click in the gutter puts the cursor at the start
   of that row. Turning wrap on or off keeps the cursor on screen.
-- **Status line:** empty by default; transient messages fade after a few seconds; prompts appear here.
+- **Status line:** empty by default; prompts appear here.
+- **Messages:** every message nib shows (errors and confirmations alike; "says" and "status" in
+  this spec mean this) appears in a small box floating at the bottom right of the text area, on
+  the three rows just above the status line, its right edge one column in from the screen's.
+  Box-drawing border in bright black, text in the default colour, one space of padding each side.
+  It fades 4 s after it appeared; a new message replaces the old one and restarts the 4 s; keys
+  do not dismiss it early. A message wider than the screen allows (a 1-column margin each side,
+  so `width - 6` cells of text) is cut and ends in `…`. On a screen under 12 columns or 6 rows,
+  the message goes on the status line instead. So does a message whose box would cover the text
+  cursor, so the cursor and the text being typed are never hidden. A message that falls back while
+  a prompt holds the status line is not shown (the prompt wins). The palette is drawn over the box.
+  - Announced actions (nothing else, so typing and movement stay quiet):
+    Save / Save As `Saved <name>` · Open `Opened <name>`, or `New file <name>` for a file not on
+    disk yet (opening at startup says nothing) · Copy / Cut / Paste `Copied <n>`, `Cut <n>`,
+    `Pasted <n>`, where `<n>` is `1 line` / `<k> lines` when the text holds a line break (a
+    trailing partial line counts), else `1 char` / `<k> chars` (grapheme clusters) · Paste with
+    an empty clipboard `Nothing to paste` · Undo / Redo `Undo` / `Redo`, or `Nothing to undo` /
+    `Nothing to redo` · Toggle Wrap `Wrap on` / `Wrap off` · Toggle Line Numbers
+    `Line numbers on` / `Line numbers off` · Select All `Selected all`.
+    Bracketed paste (the terminal's own paste) is typing and is not announced.
 - **No shortcut bar.** The command palette replaces it.
 - **Colours:** the terminal's 16 ANSI colours only, so nib follows the terminal theme.
 
@@ -58,7 +78,7 @@ regex search · multiple buffers/tabs · block selection · multiple cursors · 
 - **Open** then asks `Open: `. The name (trimmed; empty cancels) resolves like the command line,
   `:N` suffix included. A missing file gives an empty `New File` buffer, created on first save.
   Opening resets undo history, cursor, scroll, indent detection and any find. A file nib cannot
-  edit leaves the current buffer untouched and says why in the status line:
+  edit leaves the current buffer untouched and says why:
   `<name> is not a UTF-8 text file`, `<name> is a directory`, `<name> is not a regular file`.
   A file over 50 MB asks first, as at startup; N or Esc keeps the current buffer.
 - **Save As** asks `Save as: ` prefilled with the current path (empty when unnamed), with the same
@@ -150,7 +170,7 @@ so Ctrl+S / Ctrl+Q reach nib.
 | No write permission | `[Read-only]` in title; editing allowed; Save says `Cannot save: permission denied — use Save As`; Save As works. Permission is checked again on Save, so a fixed file saves. No built-in sudo. |
 | Disk full / write error | Original untouched; `Save failed: <error>`; buffer and recovery file kept. |
 | File deleted while open | Save recreates it. |
-| Broken config | Defaults used; warning in status line. |
+| Broken config | Defaults used; warning shown as a message. |
 
 ## 7. Configuration
 
@@ -186,7 +206,7 @@ redo = ["ctrl+y", "ctrl+shift+z"]  # or a list
   had it by default.
 - Any error — invalid TOML, an unknown setting, command or key name, a value of the wrong type
   or out of range, or one chord set for two commands — ignores the whole file: nib starts with
-  all defaults and shows `Config error: <msg> — using defaults` in the status line.
+  all defaults and shows `Config error: <msg> — using defaults`.
 
 ## 8. Distribution
 

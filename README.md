@@ -188,6 +188,14 @@ Delete Word Back · Delete Word Forward · New Line · Indent
 A command run from the palette does exactly what its key does: *Move Down* moves the cursor down
 a line, *Indent* inserts an indent, *Select Right* extends the selection.
 
+## Messages
+
+What nib has to tell you (`Saved notes.md`, `Copied 3 lines`, `Not found`, an error) appears in
+a small box at the bottom right, just above the status line, and fades after 4 seconds. Saving,
+opening, copy / cut / paste, undo / redo, Select All and the two toggles say what they did;
+typing and moving the cursor stay quiet. Prompts such as `Find: ` use the status line. On a very
+small terminal, or when the box would cover the cursor, the message shows on the status line.
+
 Type to filter (fuzzy and case-insensitive: `tln` finds *Toggle Line Numbers*). Up / Down or
 Ctrl+P / Ctrl+N move the selection, Enter runs the command, Esc closes the palette.
 
@@ -223,7 +231,7 @@ redo = ["ctrl+y", "ctrl+shift+z"]  # or a list
   taken away from whichever command had it by default.
 - Any mistake (invalid TOML, an unknown setting, command or key name, a wrong type or
   out-of-range value, or one key set for two commands) ignores the whole file: nib starts with
-  all defaults and shows `Config error: <message> — using defaults` in the status line.
+  all defaults and shows `Config error: <message> — using defaults`.
 
 ## License
 

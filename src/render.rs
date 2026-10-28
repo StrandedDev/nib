@@ -165,20 +165,33 @@ pub fn draw(out: &mut impl Write, app: &AppView) -> io::Result<()> {
         }
     }
 
+    let mut text_cursor = None;
+    if text_h > 0 {
+        if let Some((x, y)) = layout::cursor_screen(rope, app.viewport, app.editor.cursor) {
+            if y < text_h {
+                text_cursor = Some((x.saturating_add(app.gutter).min(w - 1), y + 1));
+            }
+        }
+    }
+    // The cursor stays in the text unless a prompt or the palette has it;
+    // a message box over it moves to the status line instead.
+    let in_text = app.prompt.is_none() && app.palette.is_none();
+    let popup = app
+        .status
+        .and_then(|m| MessageBox::fit(m, (w, h)))
+        .filter(|b| !(in_text && text_cursor.is_some_and(|c| b.covers(c))));
     let mut cursor = None;
     if h >= 2 {
-        cursor = draw_status(out, app, w, h - 1)?;
+        let line_msg = if popup.is_some() { None } else { app.status };
+        cursor = draw_status(out, app, line_msg, w, h - 1)?;
+    }
+    if let Some(b) = &popup {
+        b.draw(out)?;
     }
     if let Some(pal) = &app.palette {
         cursor = draw_palette(out, pal, (w, h))?.or(cursor);
     }
-    if cursor.is_none() && text_h > 0 {
-        if let Some((x, y)) = layout::cursor_screen(rope, app.viewport, app.editor.cursor) {
-            if y < text_h {
-                cursor = Some((x.saturating_add(app.gutter).min(w - 1), y + 1));
-            }
-        }
-    }
+    let cursor = cursor.or(text_cursor);
     if let Some((x, y)) = cursor {
         queue!(out, MoveTo(x, y), Show)?;
     }
@@ -413,11 +426,85 @@ fn draw_row(
     Ok(x)
 }
 
-/// Draws the status line at row `y`. Returns the cursor cell when a prompt
-/// is open. The last column is left empty so no terminal scrolls.
+/// Smallest screen that gets a message box; anything smaller shows the
+/// message on the status line. 12 columns leave 6 for text, 6 rows leave a
+/// text row above the box.
+const BOX_MIN: (u16, u16) = (12, 6);
+
+/// A message floating at the bottom right of the text area, just above the
+/// status line: three rows, its right edge one column in from the screen's.
+struct MessageBox {
+    x0: u16,
+    /// Top border row.
+    y0: u16,
+    /// The message, cut to fit, without padding.
+    text: String,
+}
+
+impl MessageBox {
+    /// Where `msg` goes on a `w` x `h` screen, or `None` when it is too small.
+    fn fit(msg: &str, (w, h): (u16, u16)) -> Option<MessageBox> {
+        if w < BOX_MIN.0 || h < BOX_MIN.1 {
+            return None;
+        }
+        // Borders and a space each side take 4; a column of margin each side.
+        let room = usize::from(w) - 6;
+        let msg = clean(msg);
+        let text = if msg.width() <= room {
+            msg
+        } else {
+            let cut = fit_right(&msg, room - 1);
+            format!("{}\u{2026}", cut.trim_end())
+        };
+        let mut b = MessageBox {
+            x0: 0,
+            y0: h - 4,
+            text,
+        };
+        b.x0 = w - 1 - b.width();
+        Some(b)
+    }
+
+    fn width(&self) -> u16 {
+        u16::try_from(self.text.width() + 4).unwrap_or(u16::MAX)
+    }
+
+    /// Whether the cell `(x, y)` is under the box.
+    fn covers(&self, (x, y): (u16, u16)) -> bool {
+        (self.x0..self.x0 + self.width()).contains(&x) && (self.y0..self.y0 + 3).contains(&y)
+    }
+
+    fn draw(&self, out: &mut impl Write) -> io::Result<()> {
+        let line = "\u{2500}".repeat(self.text.width() + 2);
+        queue!(
+            out,
+            MoveTo(self.x0, self.y0),
+            Fg(FG_MARK),
+            Print(format!("\u{250c}{line}\u{2510}")),
+            ResetFg,
+            MoveTo(self.x0, self.y0 + 1),
+            Fg(FG_MARK),
+            Print('\u{2502}'),
+            ResetFg,
+            Print(format!(" {} ", self.text)),
+            Fg(FG_MARK),
+            Print('\u{2502}'),
+            ResetFg,
+            MoveTo(self.x0, self.y0 + 2),
+            Fg(FG_MARK),
+            Print(format!("\u{2514}{line}\u{2518}")),
+            ResetFg,
+        )
+    }
+}
+
+/// Draws the status line at row `y`: the prompt if one is open, else `msg`.
+/// Returns the cursor cell when a prompt is open. The last column is left
+/// empty so no terminal scrolls.
 fn draw_status(
     out: &mut impl Write,
     app: &AppView,
+    msg: Option<&str>,
     w: u16,
     y: u16,
 ) -> io::Result<Option<(u16, u16)>> {
@@ -436,7 +523,7 @@ fn draw_status(
             let x = line.width().min(max);
             (line, Some(x))
         }
-        None => (fit_right(&clean(app.status.unwrap_or("")), max), None),
+        None => (fit_right(&clean(msg.unwrap_or("")), max), None),
     };
     queue!(
         out,
@@ -819,5 +906,87 @@ mod tests {
                 assert!(!f.contains("zz\u{1b}"));
             }
         }
+    }
+
+    /// A frame of `text` with message `msg`, the cursor at `at`.
+    fn message_frame(text: &str, at: Pos, msg: &str, screen: (u16, u16)) -> String {
+        let mut e = Editor::new(crate::buffer::Buffer::from_str_detect(text));
+        e.move_to(at, false);
+        let vp = Viewport::new(screen.0, screen.1.saturating_sub(2), true, 4);
+        let view = AppView {
+            editor: &e,
+            viewport: &vp,
+            screen,
+            gutter: 0,
+            name: String::new(),
+            state: String::new(),
+            status: Some(msg),
+            prompt: None,
+            find: None,
+            palette: None,
+            syntax: None,
+        };
+        let mut out = Vec::new();
+        draw(&mut out, &view).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn message_box_drawn_bottom_right_above_status_line() {
+        let f = message_frame("abc", pos(0, 0), "Saved notes.md", (40, 10));
+        // 18 wide, its right edge one column in from the screen edge, on the
+        // three rows above the status line (screen rows 7 to 9, 1-based).
+        let bar = "\u{1b}[90m\u{2502}\u{1b}[39m";
+        let top = "\u{1b}[7;22H\u{1b}[90m\u{250c}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2510}\u{1b}[39m";
+        let mid = format!("\u{1b}[8;22H{bar} Saved notes.md {bar}");
+        let bottom = "\u{1b}[9;22H\u{1b}[90m\u{2514}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2518}\u{1b}[39m";
+        assert!(f.contains(top), "{f:?}");
+        assert!(f.contains(&mid), "{f:?}");
+        assert!(f.contains(bottom), "{f:?}");
+        // The status line itself stays empty.
+        assert!(f.contains("\u{1b}[10;1H\u{1b}[K"), "{f:?}");
+        // The cursor is still drawn in the text.
+        assert!(f.ends_with("\u{1b}[2;1H\u{1b}[?25h"), "{f:?}");
+    }
+
+    #[test]
+    fn long_message_truncated_with_ellipsis() {
+        let f = message_frame("abc", pos(0, 0), "abcdefghijklmnopqrstuvwxyz", (20, 10));
+        // At most 18 wide on a 20-column screen: 14 cells of text.
+        assert!(
+            f.contains("\u{1b}[8;2H\u{1b}[90m\u{2502}\u{1b}[39m abcdefghijklm\u{2026} "),
+            "{f:?}"
+        );
+        assert!(!f.contains("nopq"), "{f:?}");
+    }
+
+    #[test]
+    fn tiny_terminal_shows_message_on_status_line() {
+        for screen in [(11, 10), (40, 5)] {
+            let f = message_frame("abc", pos(0, 0), "Saved", screen);
+            assert!(!f.contains('\u{250c}'), "{screen:?} {f:?}");
+            let row = screen.1;
+            assert!(
+                f.contains(&format!("\u{1b}[{row};1HSaved\u{1b}[K")),
+                "{f:?}"
+            );
+        }
+        // The smallest screen that still gets a box: 9 wide at columns 3 to
+        // 11, rows 3 to 5, one text row left above it.
+        let f = message_frame("abc", pos(0, 0), "Saved", (12, 6));
+        assert!(
+            f.contains("\u{1b}[4;3H\u{1b}[90m\u{2502}\u{1b}[39m Saved "),
+            "{f:?}"
+        );
+    }
+
+    #[test]
+    fn cursor_under_box_moves_message_to_status_line() {
+        let text = "x\nx\nx\nx\nx\nx\n".to_string() + &"y".repeat(30);
+        // Line 6 is screen row 8, the box's text row; column 25 is inside it.
+        let f = message_frame(&text, pos(6, 25), "Saved notes.md", (40, 10));
+        assert!(!f.contains('\u{250c}'), "{f:?}");
+        assert!(f.contains("\u{1b}[10;1HSaved notes.md\u{1b}[K"), "{f:?}");
+        assert!(f.ends_with("\u{1b}[8;26H\u{1b}[?25h"), "{f:?}");
     }
 }

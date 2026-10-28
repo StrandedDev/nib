@@ -49,22 +49,26 @@ impl Editor {
         self.buf.dirty = true;
     }
 
-    pub fn undo(&mut self) {
+    /// Undoes one step. Returns false when there was nothing to undo.
+    pub fn undo(&mut self) -> bool {
         let pos = self.undo.undo(&mut self.buf);
-        self.settle(pos);
+        self.settle(pos)
     }
 
-    pub fn redo(&mut self) {
+    /// Redoes one step. Returns false when there was nothing to redo.
+    pub fn redo(&mut self) -> bool {
         let pos = self.undo.redo(&mut self.buf);
-        self.settle(pos);
+        self.settle(pos)
     }
 
-    fn settle(&mut self, pos: Option<Pos>) {
-        if let Some(p) = pos {
-            self.cursor = cursor::clamp(&self.buf.rope, p);
-            self.anchor = None;
-            self.preferred_col = None;
-        }
+    fn settle(&mut self, pos: Option<Pos>) -> bool {
+        let Some(p) = pos else {
+            return false;
+        };
+        self.cursor = cursor::clamp(&self.buf.rope, p);
+        self.anchor = None;
+        self.preferred_col = None;
+        true
     }
 
     /// The selected char range, ordered; `None` when there is no anchor or it
