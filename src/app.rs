@@ -12,10 +12,10 @@ use crossterm::terminal;
 use crate::buffer::Buffer;
 use crate::clipboard::{Clip, Osc52};
 use crate::commands::CommandId;
-use crate::cursor;
+use crate::cursor::{self, Pos};
 use crate::edit::Editor;
 use crate::fileio;
-use crate::files::{FileFlow, file_name};
+use crate::files::{FileFlow, Then, file_name};
 use crate::find::FindSession;
 use crate::indent::Indent;
 use crate::keymap::Keymap;
@@ -48,6 +48,7 @@ pub struct App {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PromptPurpose {
     File(FileFlow),
+    GotoLine,
 }
 
 const TAB_WIDTH: u8 = 4;
@@ -181,8 +182,11 @@ impl App {
             C::Cut => self.cut(),
             C::Paste => self.paste(),
             C::Save => {
-                self.save(false);
+                self.save(Then::Stay);
             }
+            C::Open => self.ask_open(),
+            C::SaveAs => self.save_as(),
+            C::GotoLine => self.prompt = Some((Prompt::text("Line: "), PromptPurpose::GotoLine)),
             _ => self.set_status("Not available yet"),
         }
     }
@@ -261,6 +265,30 @@ impl App {
         };
         match purpose {
             PromptPurpose::File(flow) => self.file_prompt(flow, result),
+            PromptPurpose::GotoLine => {
+                if let PromptResult::Submit(input) = result {
+                    self.goto_line(&input);
+                }
+            }
+        }
+    }
+
+    /// Moves to the start of 1-based line `input`, clamped to the buffer.
+    fn goto_line(&mut self, input: &str) {
+        let s = input.trim();
+        let last = self.editor.buf.rope.len_lines() - 1;
+        let line = if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+            None
+        } else {
+            // Only overflow can fail here; that is past the end too.
+            Some(s.parse::<usize>().unwrap_or(usize::MAX))
+        };
+        match line {
+            Some(n) => {
+                let line = n.saturating_sub(1).min(last);
+                self.editor.move_to(Pos { line, col: 0 }, false);
+            }
+            None => self.set_status("Not a line number"),
         }
     }
 
@@ -568,7 +596,7 @@ mod tests {
         ));
         app.handle_event(key(KeyCode::Char('Z'), KeyModifiers::SHIFT));
         assert_eq!(app.editor.buf.rope.to_string(), "ab\nd@Z");
-        app.handle_event(key(KeyCode::Char('g'), KeyModifiers::CONTROL));
+        app.handle_event(key(KeyCode::Char('p'), KeyModifiers::CONTROL));
         assert_eq!(status(&app), "Not available yet");
         app.handle_event(Event::Paste("1\r\n2".into()));
         assert_eq!(app.editor.buf.rope.to_string(), "ab\nd@Z1\n2");
@@ -598,7 +626,7 @@ mod tests {
     #[test]
     fn status_fades_after_four_seconds() {
         let mut app = App::from_buffer(Buffer::new_empty(LineEnding::Lf), None);
-        app.dispatch(CommandId::GotoLine);
+        app.dispatch(CommandId::Palette);
         let t0 = app.status.as_ref().unwrap().1;
         let at = |s| t0 + Duration::from_millis(s);
         assert!(!app.expire_status(at(3999)));
@@ -976,5 +1004,56 @@ three"
         assert_eq!(app.editor.buf.rope.to_string(), "ZZZ ab");
         let vp = &app.viewport;
         assert_eq!((vp.hscroll, vp.hscroll_col, vp.hscroll_line), (0, 0, 0));
+    }
+
+    fn goto(app: &mut App, input: &str) {
+        app.handle_event(ctrl('g'));
+        typ(app, input);
+        app.handle_event(key(KeyCode::Enter, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn goto_clamps() {
+        let mut app = doc("a
+bb
+c");
+        app.handle_event(ctrl('g'));
+        match &app.prompt {
+            Some((Prompt::Text { label, .. }, _)) => assert_eq!(label, "Line: "),
+            _ => panic!("expected the line prompt"),
+        }
+        app.handle_event(key(KeyCode::Esc, KeyModifiers::NONE));
+        app.editor.move_to(pos(1, 2), false);
+        app.editor.move_to(pos(2, 1), true);
+        goto(&mut app, "2");
+        assert_eq!((app.editor.cursor, app.editor.anchor), (pos(1, 0), None));
+        goto(&mut app, " 99 ");
+        assert_eq!(app.editor.cursor, pos(2, 0));
+        goto(&mut app, "99999999999999999999999");
+        assert_eq!(app.editor.cursor, pos(2, 0));
+        assert!(app.prompt.is_none());
+    }
+
+    #[test]
+    fn goto_bad_input_message() {
+        for input in ["", "  ", "abc", "-1", "2x", "1.5"] {
+            let mut app = doc("a
+bb
+c");
+            app.editor.move_to(pos(1, 1), false);
+            goto(&mut app, input);
+            assert_eq!(status(&app), "Not a line number", "{input:?}");
+            assert_eq!(app.editor.cursor, pos(1, 1), "{input:?}");
+        }
+    }
+
+    #[test]
+    fn goto_zero_goes_to_first_line() {
+        let mut app = doc("a
+bb
+c");
+        app.editor.move_to(pos(2, 1), false);
+        goto(&mut app, "0");
+        assert_eq!(app.editor.cursor, pos(0, 0));
     }
 }

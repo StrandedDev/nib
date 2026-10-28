@@ -49,7 +49,20 @@ regex search · multiple buffers/tabs · block selection · multiple cursors · 
 - The `.txt` rule applies only to new files: no extension **and** not starting with `.` **and** not one of `Makefile`, `Dockerfile`, `LICENSE`, `README` (matched case-insensitively). Only the final path component is checked, so `notes.d/todo` becomes `notes.d/todo.txt`. Same rule for the first-save name prompt.
 - New files are created on **first save**, never on launch.
 - One file at a time. Opening another file (Ctrl+O) replaces the buffer; unsaved changes prompt
-  `Save? (Y)es / (N)o / (C)ancel`. Quit prompts the same way.
+  `Save? (Y)es / (N)o / (C)ancel`. Quit prompts the same way. Yes saves first (asking for a name
+  when unnamed); if that save fails or is declined, the current buffer stays.
+- **Open** then asks `Open: `. The name (trimmed; empty cancels) resolves like the command line,
+  `:N` suffix included. A missing file gives an empty `New File` buffer, created on first save.
+  Opening resets undo history, cursor, scroll, indent detection and any find. A file nib cannot
+  edit leaves the current buffer untouched and says why in the status line:
+  `<name> is not a UTF-8 text file`, `<name> is a directory`, `<name> is larger than 50 MB`.
+- **Save As** asks `Save as: ` prefilled with the current path (empty when unnamed), with the same
+  name rules and `<name> exists. Replace? (y/N)` confirm as the first-save prompt; the buffer's own
+  path needs no confirm. On success the buffer takes the new path and keeps its undo history.
+  An existing target that is not writable is refused.
+- **Go to line** (Ctrl+G) asks `Line: `; 1-based, surrounding spaces ignored, 0 and past-the-end
+  clamp to the first/last line. Anything else says `Not a line number` and leaves the cursor.
+  The cursor lands at the start of the line with no selection.
 
 ## 4. Keys
 
