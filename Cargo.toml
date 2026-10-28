@@ -43,3 +43,29 @@ unsafe_code = "forbid"
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }
+
+# Release packaging (see SPEC §8 and .github/workflows/release.yml). The
+# release job passes --output to cargo-deb / cargo-generate-rpm so the file
+# names match SPEC §8 exactly.
+[package.metadata.deb]
+maintainer = "StrandedDev"
+copyright = "StrandedDev"
+license-file = ["LICENSE", "0"] # becomes /usr/share/doc/nib/copyright
+section = "editors"
+priority = "optional"
+extended-description = """\
+nib is a small, fast, distraction-free terminal text editor in the spirit of \
+nano: atomic saves, crash recovery, a command palette and Markdown/JSON \
+highlighting. Statically linked."""
+assets = [
+    ["target/release/nib", "usr/bin/", "755"],
+    ["README.md", "usr/share/doc/nib/README.md", "644"],
+]
+
+[package.metadata.generate-rpm]
+summary = "A small, fast, distraction-free terminal text editor"
+assets = [
+    { source = "target/release/nib", dest = "/usr/bin/nib", mode = "755" },
+    { source = "README.md", dest = "/usr/share/doc/nib/README.md", mode = "644", doc = true },
+    { source = "LICENSE", dest = "/usr/share/licenses/nib/LICENSE", mode = "644" },
+]

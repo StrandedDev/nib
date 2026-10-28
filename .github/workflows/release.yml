@@ -1,0 +1,179 @@
+name: Release
+
+# Pushing a tag vX.Y.Z builds every asset listed in SPEC §8 and publishes a
+# GitHub Release. The tag must match the version in Cargo.toml.
+
+on:
+  push:
+    tags: ['v*.*.*']
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    env:
+      TARGET: x86_64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2.8.0
+        with:
+          key: x86_64-unknown-linux-musl
+      - name: Install musl-tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Install packagers
+        run: cargo install --locked cargo-deb@3.8.0 cargo-generate-rpm@0.21.1
+
+      - name: Check tag matches Cargo.toml
+        id: version
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          crate=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          if [ "$tag" != "$crate" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $crate"
+            exit 1
+          fi
+          echo "version=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        run: cargo build --release --locked --target "$TARGET"
+      - name: Smoke test
+        run: |
+          bin="target/$TARGET/release/nib"
+          "$bin" --version
+          file "$bin" | grep -Eq 'static(ally|-pie) linked'
+
+      - name: Package
+        env:
+          V: ${{ steps.version.outputs.version }}
+        run: |
+          mkdir -p dist "staging/nib-$V-x86_64-linux"
+          cp "target/$TARGET/release/nib" LICENSE README.md "staging/nib-$V-x86_64-linux/"
+          tar -C staging -czf "dist/nib-$V-x86_64-linux.tar.gz" "nib-$V-x86_64-linux"
+          cargo deb --target "$TARGET" --no-build --output "dist/nib_${V}_amd64.deb"
+          cargo generate-rpm --target "$TARGET" --output "dist/nib-$V.x86_64.rpm"
+          dpkg-deb --info "dist/nib_${V}_amd64.deb"
+          dpkg-deb --contents "dist/nib_${V}_amd64.deb"
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4.6.2
+        with:
+          name: linux
+          path: dist/*
+          if-no-files-found: error
+
+  windows:
+    # cargo-wix 0.3 needs WiX Toolset v3; installed below if the image lacks it.
+    runs-on: windows-2022
+    env:
+      TARGET: x86_64-pc-windows-msvc
+      # Static CRT: the portable zip must run without the VC++ redistributable.
+      RUSTFLAGS: -C target-feature=+crt-static
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2.8.0
+        with:
+          key: x86_64-pc-windows-msvc
+      - name: Install cargo-wix
+        run: cargo install --locked cargo-wix@0.3.9
+      - name: Ensure WiX Toolset v3
+        shell: pwsh
+        run: |
+          if ($env:WIX -and (Test-Path (Join-Path $env:WIX 'bin\candle.exe'))) {
+            Write-Host "Using WiX at $env:WIX"
+            exit 0
+          }
+          $root = Join-Path $env:RUNNER_TEMP 'wix'
+          $zip = Join-Path $env:RUNNER_TEMP 'wix314-binaries.zip'
+          Invoke-WebRequest -Uri 'https://github.com/wixtoolset/wix3/releases/download/wix3141rtm/wix314-binaries.zip' -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath (Join-Path $root 'bin')
+          "WIX=$root\" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Check tag matches Cargo.toml
+        id: version
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          crate=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          if [ "$tag" != "$crate" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $crate"
+            exit 1
+          fi
+          echo "version=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        run: cargo build --release --locked --target $env:TARGET
+      - name: Smoke test
+        run: '& "target\$env:TARGET\release\nib.exe" --version'
+
+      - name: Package
+        shell: pwsh
+        env:
+          V: ${{ steps.version.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Compress-Archive -Path "target\$env:TARGET\release\nib.exe", LICENSE, README.md `
+            -DestinationPath "dist\nib-$env:V-x86_64-windows.zip"
+          cargo wix --no-build --nocapture --target $env:TARGET --output "dist\nib-$env:V-x86_64.msi"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-ChildItem dist
+
+      - uses: actions/upload-artifact@v4.6.2
+        with:
+          name: windows
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: [linux, windows]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4.3.0
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Check assets and write SHA256SUMS
+        working-directory: dist
+        run: |
+          V="${GITHUB_REF_NAME#v}"
+          for f in \
+            "nib_${V}_amd64.deb" \
+            "nib-$V.x86_64.rpm" \
+            "nib-$V-x86_64-linux.tar.gz" \
+            "nib-$V-x86_64.msi" \
+            "nib-$V-x86_64-windows.zip"
+          do
+            [ -f "$f" ] || { echo "::error::missing asset $f"; exit 1; }
+          done
+          count=$(find . -maxdepth 1 -type f | wc -l)
+          [ "$count" -eq 5 ] || { echo "::error::expected 5 assets, found $count"; ls -l; exit 1; }
+          sha256sum -- nib* > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          V="${GITHUB_REF_NAME#v}"
+          case "$V" in *-*) pre=--prerelease ;; *) pre= ;; esac
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "nib $V" \
+            --generate-notes \
+            --verify-tag \
+            $pre
