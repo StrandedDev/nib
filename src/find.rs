@@ -5,6 +5,7 @@ use std::ops::Range;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ropey::Rope;
 
+use crate::app::App;
 use crate::cursor::{self, Pos};
 use crate::edit::Editor;
 use crate::prompt::{Prompt, PromptResult};
@@ -113,6 +114,35 @@ pub fn find_next(
     run(true).or_else(|| if wrap { run(false) } else { None })
 }
 
+impl App {
+    /// Find Next / Previous: select the next match of the last search query
+    /// from the cursor (from the selection's edge, so repeats advance).
+    pub(crate) fn repeat_find(&mut self, forward: bool) {
+        let Some(q) = self.last_search.clone() else {
+            return self.set_status("No previous search");
+        };
+        let ed = &mut self.editor;
+        let sel = ed.selection();
+        let from = match (&sel, forward) {
+            (Some(r), true) => r.end,
+            (Some(r), false) => r.start,
+            (None, _) => cursor::to_char_idx(&ed.buf.rope, ed.cursor),
+        };
+        let Some((m, wrapped)) = find_next(&ed.buf.rope, &q, from, forward, true) else {
+            return self.set_status("Not found");
+        };
+        let (a, b) = (
+            cursor::from_char_idx(&ed.buf.rope, m.start),
+            cursor::from_char_idx(&ed.buf.rope, m.end),
+        );
+        ed.move_to(a, false);
+        ed.move_to(b, true);
+        if wrapped {
+            self.set_status("Search wrapped");
+        }
+    }
+}
+
 /// Non-overlapping matches that overlap `range`, in order. Reads only the
 /// lines touching `range`, and on each only the part near it, so the cost
 /// follows what is on screen.
@@ -202,6 +232,11 @@ impl FindSession {
             limit: 0,
             wrapped: false,
         }
+    }
+
+    /// The search text, if any was typed.
+    pub fn query(&self) -> Option<&str> {
+        Some(self.query.as_str()).filter(|q| !q.is_empty())
     }
 
     pub fn prompt(&self) -> &Prompt {

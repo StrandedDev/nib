@@ -19,6 +19,7 @@ use crate::cursor::{Pos, from_char_idx, line_text};
 use crate::edit::Editor;
 use crate::find::FindSession;
 use crate::layout::{self, Row, Viewport};
+use crate::palette::Item;
 use crate::prompt::Prompt;
 
 /// Shown in place of a control char so it never reaches the terminal raw.
@@ -60,6 +61,14 @@ pub struct AppView<'a> {
     pub prompt: Option<&'a Prompt>,
     /// The open find/replace session: its matches are underlined.
     pub find: Option<&'a FindSession>,
+    pub palette: Option<PaletteView<'a>>,
+}
+
+/// The open command palette, ready to draw.
+pub struct PaletteView<'a> {
+    pub query: &'a str,
+    pub selected: usize,
+    pub items: Vec<Item>,
 }
 
 pub fn draw(out: &mut impl Write, app: &AppView) -> io::Result<()> {
@@ -95,6 +104,9 @@ pub fn draw(out: &mut impl Write, app: &AppView) -> io::Result<()> {
     if h >= 2 {
         cursor = draw_status(out, app, w, h - 1)?;
     }
+    if let Some(pal) = &app.palette {
+        cursor = draw_palette(out, pal, (w, h))?.or(cursor);
+    }
     if cursor.is_none() && text_h > 0 {
         if let Some((x, y)) = layout::cursor_screen(rope, app.viewport, app.editor.cursor) {
             if y < text_h {
@@ -106,6 +118,101 @@ pub fn draw(out: &mut impl Write, app: &AppView) -> io::Result<()> {
         queue!(out, MoveTo(x, y), Show)?;
     }
     out.flush()
+}
+
+const PALETTE_WIDTH: u16 = 60;
+const PALETTE_ROWS: usize = 10;
+
+/// Draws the palette box from the top centre, below the title bar: a query
+/// line, then up to ten commands, the selected one in reverse video. A
+/// terminal under 20x5 gets no border. Returns the cursor cell.
+fn draw_palette(
+    out: &mut impl Write,
+    pal: &PaletteView,
+    (w, h): (u16, u16),
+) -> io::Result<Option<(u16, u16)>> {
+    let avail = usize::from(h.saturating_sub(2));
+    if w == 0 || avail == 0 {
+        return Ok(None);
+    }
+    let border = w >= 20 && h >= 5;
+    let width = if border { PALETTE_WIDTH.min(w - 2) } else { w };
+    let x0 = (w - width) / 2;
+    let inner = usize::from(width) - if border { 2 } else { 0 };
+    let rows = PALETTE_ROWS.min(avail - if border { 3.min(avail) } else { 1 });
+    let bx = BoxCols { x0, border, inner };
+    let mut y = 1;
+    if border {
+        bx.edge(out, y, ('\u{250c}', '\u{2510}'))?;
+        y += 1;
+    }
+    let query = fit_left(
+        &format!("> {}", clean(pal.query)),
+        inner.saturating_sub(1),
+        "\u{2026}",
+    );
+    let cursor = (
+        x0 + u16::from(border) + u16::try_from(query.width()).unwrap_or(0),
+        y,
+    );
+    bx.side(out, y, &pad(&query, inner), false)?;
+    // Scroll so the selected row stays in view.
+    let first = (pal.selected + 1).saturating_sub(rows);
+    for (i, item) in pal.items.iter().enumerate().skip(first).take(rows) {
+        y += 1;
+        bx.side(out, y, &item_line(item, inner), i == pal.selected)?;
+    }
+    if border {
+        bx.edge(out, y + 1, ('\u{2514}', '\u{2518}'))?;
+    }
+    Ok(Some(cursor))
+}
+
+/// Where the palette box sits: its left column, border and inner width.
+struct BoxCols {
+    x0: u16,
+    border: bool,
+    inner: usize,
+}
+
+impl BoxCols {
+    /// One content row between the vertical borders, if any.
+    fn side(&self, out: &mut impl Write, y: u16, text: &str, rev: bool) -> io::Result<()> {
+        let bar = if self.border { "\u{2502}" } else { "" };
+        queue!(out, MoveTo(self.x0, y), Print(bar))?;
+        if rev {
+            queue!(out, SetAttribute(Attribute::Reverse))?;
+        }
+        queue!(out, Print(text))?;
+        if rev {
+            queue!(out, SetAttribute(Attribute::NoReverse))?;
+        }
+        queue!(out, Print(bar))
+    }
+
+    /// The top or bottom border.
+    fn edge(&self, out: &mut impl Write, y: u16, (l, r): (char, char)) -> io::Result<()> {
+        let line = "\u{2500}".repeat(self.inner);
+        queue!(out, MoveTo(self.x0, y), Print(format!("{l}{line}{r}")))
+    }
+}
+
+/// `s` padded with spaces to exactly `width` cells.
+fn pad(s: &str, width: usize) -> String {
+    format!("{s}{}", " ".repeat(width.saturating_sub(s.width())))
+}
+
+/// Name on the left, keys on the right, `width` cells in all.
+fn item_line(item: &Item, width: usize) -> String {
+    let name = fit_right(&clean(item.name), width);
+    let keys = clean(&item.keys);
+    let keys = if name.width() + 1 + keys.width() <= width {
+        keys
+    } else {
+        String::new()
+    };
+    let gap = width - name.width() - keys.width();
+    format!("{name}{}{keys}", " ".repeat(gap))
 }
 
 /// Draws the line number of `row` right-aligned in `width` columns, or a
@@ -380,6 +487,7 @@ mod tests {
             status: None,
             prompt: None,
             find: None,
+            palette: None,
         };
         let mut out = Vec::new();
         draw(&mut out, &view).unwrap();
@@ -433,6 +541,7 @@ mod tests {
             status: None,
             prompt: Some(f.prompt()),
             find: Some(&f),
+            palette: None,
         };
         let mut out = Vec::new();
         draw(&mut out, &view).unwrap();
@@ -457,6 +566,7 @@ mod tests {
             status: None,
             prompt: None,
             find: None,
+            palette: None,
         };
         let mut out = Vec::new();
         draw(&mut out, &view).unwrap();
@@ -496,6 +606,7 @@ mod tests {
             status: None,
             prompt: Some(f.prompt()),
             find: Some(&f),
+            palette: None,
         };
         let mut out = Vec::new();
         let t = std::time::Instant::now();
@@ -507,5 +618,63 @@ mod tests {
             "matches still underlined"
         );
         assert!(took < std::time::Duration::from_millis(50), "{took:?}");
+    }
+
+    fn palette_frame(query: &str, selected: usize, screen: (u16, u16)) -> String {
+        use crate::keymap::Keymap;
+        use crate::palette::Palette;
+        let e = Editor::new(crate::buffer::Buffer::from_str_detect("text"));
+        let vp = Viewport::new(screen.0, screen.1.saturating_sub(2), true, 4);
+        let pal = Palette {
+            query: query.into(),
+            selected,
+        };
+        let view = AppView {
+            editor: &e,
+            viewport: &vp,
+            screen,
+            gutter: 0,
+            name: String::new(),
+            state: String::new(),
+            status: None,
+            prompt: None,
+            find: None,
+            palette: Some(PaletteView {
+                query,
+                selected,
+                items: pal.items(&Keymap::defaults()),
+            }),
+        };
+        let mut out = Vec::new();
+        draw(&mut out, &view).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn palette_overlay_has_border_query_and_selected_row() {
+        let f = palette_frame("sa", 0, (80, 24));
+        // 60 wide, centred: starts at column 10, below the title bar.
+        assert!(f.contains("\u{1b}[2;11H\u{250c}"), "{f:?}");
+        assert!(f.contains("> sa"), "{f:?}");
+        // "Save" outranks "Save As"; the selected row is reversed, keys right-aligned.
+        assert!(f.contains("\u{2502}\u{1b}[7mSave  "), "{f:?}");
+        assert!(f.contains("Ctrl+S\u{1b}[27m\u{2502}"), "{f:?}");
+        assert!(f.contains("\u{2502}Save As  "), "{f:?}");
+        // The cursor sits after the query.
+        assert!(f.ends_with("\u{1b}[3;16H\u{1b}[?25h"), "{f:?}");
+    }
+
+    #[test]
+    fn palette_narrow_terminal() {
+        // Too small for a border: the box is drawn without one.
+        let f = palette_frame("q", 0, (15, 6));
+        assert!(!f.contains('\u{250c}') && !f.contains('\u{2502}'), "{f:?}");
+        assert!(f.contains("> q"), "{f:?}");
+        for w in 0..30 {
+            for h in 0..12 {
+                let f = palette_frame("zz\u{1b}", 3, (w, h));
+                assert!(!f.contains("zz\u{1b}"));
+            }
+        }
     }
 }

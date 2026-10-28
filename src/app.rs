@@ -20,8 +20,9 @@ use crate::find::FindSession;
 use crate::indent::Indent;
 use crate::keymap::Keymap;
 use crate::layout::{self, Viewport};
+use crate::palette::Palette;
 use crate::prompt::{Prompt, PromptResult};
-use crate::render::{self, AppView};
+use crate::render::{self, AppView, PaletteView};
 use crate::terminal::Guard;
 
 pub struct App {
@@ -37,6 +38,9 @@ pub struct App {
     pub(crate) read_only: bool,
     pub(crate) prompt: Option<(Prompt, PromptPurpose)>,
     pub(crate) find: Option<FindSession>,
+    pub(crate) palette: Option<Palette>,
+    /// Query of the last find session, repeated by Find Next / Previous.
+    pub(crate) last_search: Option<String>,
     pub(crate) status: Option<(String, Instant)>,
     /// Time and cell of the last left-button press, for double-click.
     pub(crate) last_click: Option<(Instant, u16, u16)>,
@@ -117,6 +121,11 @@ impl App {
             prompt: (self.find.as_ref().map(FindSession::prompt))
                 .or(self.prompt.as_ref().map(|(p, _)| p)),
             find: self.find.as_ref(),
+            palette: self.palette.as_ref().map(|p| PaletteView {
+                query: &p.query,
+                selected: p.selected,
+                items: p.items(&self.keymap),
+            }),
         }
     }
 
@@ -197,7 +206,23 @@ impl App {
                 self.relayout();
             }
             C::GotoLine => self.prompt = Some((Prompt::text("Line: "), PromptPurpose::GotoLine)),
-            _ => self.set_status("Not available yet"),
+            C::Palette => self.palette = Some(Palette::default()),
+            // Moves were handled above.
+            C::Left
+            | C::Right
+            | C::WordLeft
+            | C::WordRight
+            | C::Home
+            | C::End
+            | C::FileStart
+            | C::FileEnd
+            | C::SelLeft
+            | C::SelRight
+            | C::SelWordLeft
+            | C::SelWordRight
+            | C::SelHome
+            | C::SelEnd => {}
+            C::FindNext | C::FindPrev => self.repeat_find(id == C::FindNext),
         }
     }
 
@@ -348,6 +373,7 @@ impl App {
             self.viewport.invalidate();
         }
         if out.close {
+            self.last_search = f.query().map(str::to_string).or(self.last_search.take());
             self.find = None;
         }
         self.status_from(out.status);
@@ -365,7 +391,9 @@ impl App {
     pub(crate) fn handle_event(&mut self, ev: Event) {
         match ev {
             Event::Key(key) if key.kind != KeyEventKind::Release => {
-                if self.find.is_some() {
+                if self.palette.is_some() {
+                    self.palette_key(&key);
+                } else if self.find.is_some() {
                     self.find_key(&key);
                 } else if self.prompt.is_some() {
                     self.prompt_key(&key);
@@ -382,6 +410,7 @@ impl App {
                 self.viewport.width = w.saturating_sub(self.gutter());
                 self.relayout();
             }
+            Event::Paste(_) if self.palette.is_some() => {}
             Event::Paste(s) => match (&mut self.find, &mut self.prompt) {
                 (Some(f), _) => {
                     let out = f.paste(&s, &mut self.editor);
@@ -404,7 +433,7 @@ impl App {
 
     /// Mouse handling with an explicit clock, so double-click timing is testable.
     fn handle_mouse_at(&mut self, m: MouseEvent, now: Instant) {
-        if self.prompt.is_some() || self.find.is_some() {
+        if self.prompt.is_some() || self.find.is_some() || self.palette.is_some() {
             return;
         }
         // The text area sits between the title row and the status row.
@@ -465,6 +494,8 @@ impl App {
             read_only: false,
             prompt: None,
             find: None,
+            palette: None,
+            last_search: None,
             status: None,
             last_click: None,
             clip: Box::new(Osc52::default()),
@@ -639,7 +670,8 @@ mod tests {
         app.handle_event(key(KeyCode::Char('Z'), KeyModifiers::SHIFT));
         assert_eq!(app.editor.buf.rope.to_string(), "ab\nd@Z");
         app.handle_event(key(KeyCode::Char('p'), KeyModifiers::CONTROL));
-        assert_eq!(status(&app), "Not available yet");
+        assert!(app.palette.is_some());
+        app.handle_event(key(KeyCode::Esc, KeyModifiers::NONE));
         app.handle_event(Event::Paste("1\r\n2".into()));
         assert_eq!(app.editor.buf.rope.to_string(), "ab\nd@Z1\n2");
     }
@@ -668,11 +700,11 @@ mod tests {
     #[test]
     fn status_fades_after_four_seconds() {
         let mut app = App::from_buffer(Buffer::new_empty(LineEnding::Lf), None);
-        app.dispatch(CommandId::Palette);
+        app.dispatch(CommandId::Copy);
         let t0 = app.status.as_ref().unwrap().1;
         let at = |s| t0 + Duration::from_millis(s);
         assert!(!app.expire_status(at(3999)));
-        assert_eq!(app.status_text(), Some("Not available yet"));
+        assert_eq!(app.status_text(), Some("Nothing selected"));
         assert!(app.expire_status(at(4000)));
         assert_eq!(app.status_text(), None);
         assert!(!app.expire_status(at(5000)));
@@ -1155,5 +1187,86 @@ three"
         assert_eq!(app.editor.cursor, pos(1, 0));
         app.handle_mouse_at(drag(4, 3), t + Duration::from_secs(3));
         assert_eq!(app.editor.selection(), Some(31..32));
+    }
+
+    fn palette_type(app: &mut App, s: &str) {
+        app.handle_event(ctrl('p'));
+        typ(app, s);
+    }
+
+    #[test]
+    fn palette_runs_save_as_prompt() {
+        let mut app = doc("x");
+        palette_type(&mut app, "sva");
+        app.handle_event(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.palette.is_none());
+        assert!(
+            matches!(&app.prompt, Some((Prompt::Text { label, .. }, _)) if label == "Save as: ")
+        );
+    }
+
+    #[test]
+    fn palette_esc_closes() {
+        let mut app = doc("x");
+        palette_type(&mut app, "q");
+        assert!(app.palette.is_some());
+        app.handle_event(key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.palette.is_none() && !app.quit);
+        // While open, typing goes to the query, not the buffer.
+        palette_type(&mut app, "abc");
+        assert_eq!(app.editor.buf.rope.to_string(), "x");
+    }
+
+    /// Runs a find for `q`, then closes it with Esc so the query is remembered.
+    fn search(app: &mut App, q: &str) {
+        app.dispatch(CommandId::Find);
+        typ(app, q);
+        app.handle_event(key(KeyCode::Esc, KeyModifiers::NONE));
+        app.editor.move_to(pos(0, 0), false);
+    }
+
+    #[test]
+    fn find_next_repeats_last_query() {
+        let mut app = doc("ab ab ab");
+        search(&mut app, "ab");
+        app.dispatch(CommandId::FindNext);
+        assert_eq!(app.editor.selection(), Some(0..2));
+        app.dispatch(CommandId::FindNext);
+        assert_eq!(app.editor.selection(), Some(3..5));
+        app.dispatch(CommandId::FindNext);
+        app.dispatch(CommandId::FindNext);
+        assert_eq!(app.editor.selection(), Some(0..2));
+        app.dispatch(CommandId::FindPrev);
+        assert_eq!(app.editor.selection(), Some(6..8));
+        search(&mut app, "zz");
+        app.dispatch(CommandId::FindNext);
+        assert_eq!(status(&app), "Not found");
+    }
+
+    #[test]
+    fn find_prev_wraps() {
+        let mut app = doc("ab ab");
+        search(&mut app, "ab");
+        app.dispatch(CommandId::FindPrev);
+        assert_eq!(app.editor.selection(), Some(3..5));
+    }
+
+    #[test]
+    fn find_next_without_query_status() {
+        let mut app = doc("ab");
+        app.dispatch(CommandId::FindNext);
+        assert_eq!(status(&app), "No previous search");
+        app.dispatch(CommandId::FindPrev);
+        assert_eq!(status(&app), "No previous search");
+    }
+
+    #[test]
+    fn no_command_is_unavailable() {
+        for c in crate::commands::COMMANDS {
+            let mut app = doc("ab
+cd");
+            app.dispatch(c.id);
+            assert_ne!(app.status_text(), Some("Not available yet"), "{:?}", c.id);
+        }
     }
 }

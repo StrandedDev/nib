@@ -11,6 +11,7 @@ pub mod find;
 pub mod indent;
 pub mod keymap;
 pub mod layout;
+pub mod palette;
 pub mod prompt;
 pub mod render;
 pub mod terminal;
