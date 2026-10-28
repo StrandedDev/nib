@@ -1,0 +1,4 @@
+# Build into ./target inside the repo, overriding any machine-wide
+# target-dir in $CARGO_HOME/config.toml.
+[build]
+target-dir = "target"

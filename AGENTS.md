@@ -2,12 +2,11 @@
 
 `SPEC.md` is the source of truth for behaviour. Read the relevant section before changing a feature; update it in the same change when behaviour changes.
 
-## Local toolchain (Windows dev machine)
+## Local toolchain
 
-- Rust lives on **N:**, not C: (C: is nearly full). `CARGO_HOME=N:\Dependencies\rust\cargo`, `RUSTUP_HOME=N:\Dependencies\rust\rustup`. Install any new tool (`cargo install …`, SDKs, caches) under `N:\Dependencies\`.
-- Host toolchain is `stable-x86_64-pc-windows-gnu` (no MSVC Build Tools installed). CI and releases build MSVC/musl targets; local builds are gnu.
-- Build output goes to `N:/Dependencies/rust/target` (set in `$CARGO_HOME/config.toml`) because the repo sits inside OneDrive. Look there for binaries, not `./target`.
-- A shell started before the install may lack these env vars; prefix commands with them if `cargo` is not found.
+- Rust 1.85 or later. CI and releases build MSVC/musl targets; local builds use whatever host toolchain is installed.
+- Build output goes to `./target` inside the repo (set in `.cargo/config.toml`, which overrides any machine-wide `target-dir`). The release binary is `target/release/nib` (`nib.exe` on Windows).
+- Keep machine-specific setup (toolchain locations, drive letters, user paths) out of tracked files.
 
 ## Checks
 
