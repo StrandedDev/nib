@@ -1,23 +1,23 @@
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime};
 
-use anyhow::{Context, Result, bail};
+use anyhow::Result;
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
     MouseEventKind,
 };
 use crossterm::terminal;
 
-use crate::buffer::{Buffer, LineEnding};
-use crate::cli;
+use crate::buffer::Buffer;
 use crate::clipboard::{Clip, Osc52};
 use crate::commands::CommandId;
-use crate::cursor::{self, Pos};
+use crate::cursor;
 use crate::edit::Editor;
-use crate::fileio::{self, Loaded};
+use crate::fileio;
+use crate::files::{FileFlow, file_name};
 use crate::find::FindSession;
-use crate::indent::{self, Indent};
+use crate::indent::Indent;
 use crate::keymap::Keymap;
 use crate::layout::{self, Viewport};
 use crate::prompt::{Prompt, PromptResult};
@@ -25,30 +25,29 @@ use crate::render::{self, AppView};
 use crate::terminal::Guard;
 
 pub struct App {
-    editor: Editor,
-    path: Option<PathBuf>,
-    viewport: Viewport,
+    pub(crate) editor: Editor,
+    pub(crate) path: Option<PathBuf>,
+    pub(crate) viewport: Viewport,
     /// Terminal size (columns, rows).
-    screen: (u16, u16),
-    keymap: Keymap,
+    pub(crate) screen: (u16, u16),
+    pub(crate) keymap: Keymap,
     /// Never saved: no file on disk yet.
-    is_new: bool,
-    disk_mtime: Option<SystemTime>,
-    read_only: bool,
-    prompt: Option<(Prompt, PromptPurpose)>,
-    find: Option<FindSession>,
-    status: Option<(String, Instant)>,
+    pub(crate) is_new: bool,
+    pub(crate) disk_mtime: Option<SystemTime>,
+    pub(crate) read_only: bool,
+    pub(crate) prompt: Option<(Prompt, PromptPurpose)>,
+    pub(crate) find: Option<FindSession>,
+    pub(crate) status: Option<(String, Instant)>,
     /// Time and cell of the last left-button press, for double-click.
-    last_click: Option<(Instant, u16, u16)>,
-    clip: Box<dyn Clip>,
-    quit: bool,
+    pub(crate) last_click: Option<(Instant, u16, u16)>,
+    pub(crate) clip: Box<dyn Clip>,
+    pub(crate) quit: bool,
 }
 
+/// What the open prompt is for.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum PromptPurpose {
-    SaveBeforeQuit,
-    SaveName { then_quit: bool },
-    ConfirmReplace { path: PathBuf, then_quit: bool },
+pub(crate) enum PromptPurpose {
+    File(FileFlow),
 }
 
 const TAB_WIDTH: u8 = 4;
@@ -56,39 +55,9 @@ const STATUS_FADE: Duration = Duration::from_secs(4);
 const WHEEL_ROWS: isize = 3;
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 const POLL: Duration = Duration::from_millis(250);
-const SAVE_CHOICE: &str = "Save? (Y)es / (N)o / (C)ancel";
 
 impl App {
-    /// Loads `path` (or starts an unnamed buffer) and puts the cursor on
-    /// 1-based `line`, clamped. Never writes to disk.
-    pub fn open(path: Option<PathBuf>, line: Option<usize>) -> Result<App> {
-        let Some(path) = path else {
-            return Ok(App::from_buffer(Buffer::new_empty(LineEnding::Lf), None));
-        };
-        let name = file_name(&path);
-        let loaded = fileio::load(&path, false).with_context(|| format!("cannot open {name}"))?;
-        let (buf, is_new) = match loaded {
-            Loaded::Text(b) => (b, false),
-            Loaded::NotFound => (Buffer::new_empty(LineEnding::Lf), true),
-            Loaded::Binary => bail!("{name} is not a UTF-8 text file"),
-            Loaded::Directory => bail!("{name} is a directory"),
-            Loaded::TooLarge(_) => bail!("{name} is larger than 50 MB"),
-        };
-        let mut app = App::from_buffer(buf, None);
-        app.set_indent(indent::detect_indent(&app.editor.buf.rope, &name));
-        app.is_new = is_new;
-        app.disk_mtime = fileio::mtime(&path);
-        app.read_only = !is_new && !fileio::is_writable(&path);
-        app.path = Some(path);
-        if let Some(n) = line {
-            let last = app.editor.buf.rope.len_lines() - 1;
-            let line = n.saturating_sub(1).min(last);
-            app.editor.move_to(Pos { line, col: 0 }, false);
-        }
-        Ok(app)
-    }
-
-    fn set_indent(&mut self, indent: Indent) {
+    pub(crate) fn set_indent(&mut self, indent: Indent) {
         self.editor.indent = indent;
         self.viewport.tab_width = match indent {
             Indent::Spaces(n) => n,
@@ -261,40 +230,7 @@ impl App {
         e.preferred_col = Some(usize::from(x));
     }
 
-    /// Saves to the current path, or asks for a name first. Returns whether
-    /// the buffer is now saved; `then_quit` quits after a save from the name prompt.
-    fn save(&mut self, then_quit: bool) -> bool {
-        match self.path.clone() {
-            Some(path) => self.save_to(path),
-            None => {
-                let p = Prompt::text("File name: ");
-                self.prompt = Some((p, PromptPurpose::SaveName { then_quit }));
-                false
-            }
-        }
-    }
-
-    fn save_to(&mut self, path: PathBuf) -> bool {
-        if self.read_only {
-            self.set_status("Cannot save: permission denied \u{2014} use Save As");
-            return false;
-        }
-        if let Err(e) = fileio::atomic_write(&path, &self.editor.buf.to_bytes()) {
-            self.set_status(&format!("Save failed: {e}"));
-            return false;
-        }
-        self.editor.buf.dirty = false;
-        self.editor.mark_saved();
-        self.disk_mtime = fileio::mtime(&path);
-        if self.is_new {
-            self.read_only = !fileio::is_writable(&path);
-            self.is_new = false;
-        }
-        self.path = Some(path);
-        true
-    }
-
-    fn set_status(&mut self, msg: &str) {
+    pub(crate) fn set_status(&mut self, msg: &str) {
         self.status = Some((msg.to_string(), Instant::now()));
     }
 
@@ -312,18 +248,6 @@ impl App {
         self.status.as_ref().map(|(s, _)| s.as_str())
     }
 
-    fn quit(&mut self) {
-        if self.editor.buf.dirty {
-            let p = Prompt::Choice {
-                label: SAVE_CHOICE.to_string(),
-                keys: &['y', 'n', 'c'],
-            };
-            self.prompt = Some((p, PromptPurpose::SaveBeforeQuit));
-        } else {
-            self.quit = true;
-        }
-    }
-
     fn prompt_key(&mut self, key: &KeyEvent) {
         let Some((prompt, _)) = &mut self.prompt else {
             return;
@@ -335,21 +259,8 @@ impl App {
         let Some((_, purpose)) = self.prompt.take() else {
             return;
         };
-        match (purpose, result) {
-            (PromptPurpose::SaveName { then_quit }, PromptResult::Submit(name)) => {
-                self.save_named(&name, then_quit);
-            }
-            (PromptPurpose::ConfirmReplace { path, then_quit }, PromptResult::Choice('y')) => {
-                self.save_then(path, then_quit);
-            }
-            (PromptPurpose::ConfirmReplace { .. }, _) => self.set_status("Not saved"),
-            (PromptPurpose::SaveBeforeQuit, PromptResult::Choice('y')) => {
-                if self.save(true) {
-                    self.quit = true;
-                }
-            }
-            (PromptPurpose::SaveBeforeQuit, PromptResult::Choice('n')) => self.quit = true,
-            _ => {}
+        match purpose {
+            PromptPurpose::File(flow) => self.file_prompt(flow, result),
         }
     }
 
@@ -376,40 +287,6 @@ impl App {
     fn status_from(&mut self, status: Option<String>) {
         if let Some(msg) = status {
             self.set_status(&msg);
-        }
-    }
-
-    /// First save under a typed name. An existing target is only replaced
-    /// after a yes.
-    fn save_named(&mut self, name: &str, then_quit: bool) {
-        let name = name.trim();
-        if name.is_empty() {
-            return;
-        }
-        // Same rules as the command line: an existing name is kept as typed,
-        // a new one gets the .txt rule. A `:N` suffix is dropped.
-        let (path, _) = cli::resolve(name, |p| p.exists());
-        let path = std::path::absolute(&path).unwrap_or(path);
-        // `new_file_name` splits on both separators, so this does too.
-        let no_name = name.ends_with(['/', '\\']) || Path::new(name).file_name().is_none();
-        if no_name || path.is_dir() {
-            self.set_status("Not a file name");
-            return;
-        }
-        if path.exists() {
-            let p = Prompt::Choice {
-                label: format!("{} exists. Replace? (y/N)", file_name(&path)),
-                keys: &['y', 'n'],
-            };
-            self.prompt = Some((p, PromptPurpose::ConfirmReplace { path, then_quit }));
-        } else {
-            self.save_then(path, then_quit);
-        }
-    }
-
-    fn save_then(&mut self, path: PathBuf, then_quit: bool) {
-        if self.save_to(path) && then_quit {
-            self.quit = true;
         }
     }
 
@@ -532,14 +409,6 @@ fn normalise_paste(s: &str) -> String {
     s.replace("\r\n", "\n").replace('\r', "\n")
 }
 
-/// Last path component for display, or the whole path when it has none.
-fn file_name(path: &Path) -> String {
-    path.file_name()
-        .unwrap_or(path.as_os_str())
-        .to_string_lossy()
-        .into_owned()
-}
-
 /// Text typed by a key that no command claimed. Ctrl+Alt counts as text
 /// because that is how AltGr arrives on Windows.
 fn typed_char(key: &KeyEvent) -> Option<char> {
@@ -552,7 +421,7 @@ fn typed_char(key: &KeyEvent) -> Option<char> {
 }
 
 /// Right side of the title bar. The only place that builds it.
-fn title_state(app: &App) -> String {
+pub(crate) fn title_state(app: &App) -> String {
     let state = if app.editor.buf.dirty {
         "Modified".to_string()
     } else if app.is_new {
@@ -567,9 +436,76 @@ fn title_state(app: &App) -> String {
     }
 }
 
+/// Test helpers shared by the app and file-flow tests.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::path::PathBuf;
+
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+
+    use super::App;
+    use crate::buffer::{Buffer, LineEnding};
+    use crate::cursor::Pos;
+
+    pub(crate) fn existing(d: &tempfile::TempDir, text: &str) -> (PathBuf, App) {
+        let p = d.path().join("a.txt");
+        std::fs::write(&p, text).unwrap();
+        let app = App::open(Some(p.clone()), None).unwrap();
+        (p, app)
+    }
+
+    pub(crate) fn key(code: KeyCode, mods: KeyModifiers) -> Event {
+        Event::Key(KeyEvent::new(code, mods))
+    }
+
+    pub(crate) fn typ(app: &mut App, s: &str) {
+        for c in s.chars() {
+            app.handle_event(key(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+    }
+
+    pub(crate) fn set_readonly(p: &std::path::Path, ro: bool) {
+        let mut perm = std::fs::metadata(p).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perm.set_readonly(ro);
+        std::fs::set_permissions(p, perm).unwrap();
+    }
+
+    pub(crate) fn status(app: &App) -> &str {
+        app.status.as_ref().map_or("", |(s, _)| s)
+    }
+
+    pub(crate) fn press(app: &mut App, c: char) {
+        app.handle_event(key(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+
+    pub(crate) fn pos(line: usize, col: usize) -> Pos {
+        Pos { line, col }
+    }
+
+    pub(crate) fn unnamed_with(text: &str) -> App {
+        let mut app = App::from_buffer(Buffer::new_empty(LineEnding::Lf), None);
+        typ(&mut app, text);
+        app
+    }
+
+    pub(crate) fn submit_name(app: &mut App, p: &std::path::Path) {
+        typ(app, &p.to_string_lossy());
+        app.handle_event(key(KeyCode::Enter, KeyModifiers::NONE));
+    }
+
+    pub(crate) fn ctrl(c: char) -> Event {
+        key(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::test_support::*;
     use super::*;
+
+    use crate::buffer::LineEnding;
+    use crate::cursor::Pos;
 
     use tempfile::tempdir;
 
@@ -578,23 +514,6 @@ mod tests {
         let d = tempdir().unwrap();
         let app = App::open(Some(d.path().join("new.txt")), None).unwrap();
         assert_eq!(title_state(&app), "New File");
-    }
-
-    fn existing(d: &tempfile::TempDir, text: &str) -> (PathBuf, App) {
-        let p = d.path().join("a.txt");
-        std::fs::write(&p, text).unwrap();
-        let app = App::open(Some(p.clone()), None).unwrap();
-        (p, app)
-    }
-
-    fn key(code: KeyCode, mods: KeyModifiers) -> Event {
-        Event::Key(KeyEvent::new(code, mods))
-    }
-
-    fn typ(app: &mut App, s: &str) {
-        for c in s.chars() {
-            app.handle_event(key(KeyCode::Char(c), KeyModifiers::NONE));
-        }
     }
 
     #[test]
@@ -614,13 +533,6 @@ mod tests {
         assert_eq!(title_state(&app), want);
     }
 
-    fn set_readonly(p: &std::path::Path, ro: bool) {
-        let mut perm = std::fs::metadata(p).unwrap().permissions();
-        #[allow(clippy::permissions_set_readonly_false)]
-        perm.set_readonly(ro);
-        std::fs::set_permissions(p, perm).unwrap();
-    }
-
     #[test]
     fn title_state_read_only_suffix() {
         let d = tempdir().unwrap();
@@ -635,168 +547,6 @@ mod tests {
         assert!(clean.ends_with(" [Read-only]"), "{clean}");
         assert!(clean.len() > " [Read-only]".len(), "{clean}");
         assert_eq!(modified, "Modified [Read-only]");
-    }
-
-    #[test]
-    fn quit_dirty_opens_choice_prompt() {
-        let d = tempdir().unwrap();
-        let (_, mut app) = existing(&d, "abc\n");
-        typ(&mut app, "x");
-        app.dispatch(CommandId::Quit);
-        assert!(!app.quit);
-        match &app.prompt {
-            Some((Prompt::Choice { label, keys }, PromptPurpose::SaveBeforeQuit)) => {
-                assert_eq!(label, "Save? (Y)es / (N)o / (C)ancel");
-                assert_eq!(*keys, &['y', 'n', 'c']);
-            }
-            _ => panic!("expected the save choice"),
-        }
-    }
-
-    #[test]
-    fn save_writes_via_atomic_write() {
-        let d = tempdir().unwrap();
-        let p = d.path().join("new.txt");
-        let mut app = App::open(Some(p.clone()), None).unwrap();
-        typ(&mut app, "hi");
-        app.dispatch(CommandId::Save);
-        assert_eq!(std::fs::read_to_string(&p).unwrap(), "hi\n");
-        assert!(!app.editor.buf.dirty);
-        assert_eq!(app.disk_mtime, fileio::mtime(&p));
-        assert_eq!(
-            title_state(&app),
-            fileio::format_mtime(app.disk_mtime.unwrap())
-        );
-    }
-
-    fn status(app: &App) -> &str {
-        app.status.as_ref().map_or("", |(s, _)| s)
-    }
-
-    #[test]
-    fn save_read_only_fails_and_stays_dirty() {
-        let d = tempdir().unwrap();
-        let p = d.path().join("ro.txt");
-        std::fs::write(&p, "abc\n").unwrap();
-        set_readonly(&p, true);
-        let mut app = App::open(Some(p.clone()), None).unwrap();
-        typ(&mut app, "x");
-        app.dispatch(CommandId::Save);
-        set_readonly(&p, false);
-        assert_eq!(
-            status(&app),
-            "Cannot save: permission denied \u{2014} use Save As"
-        );
-        assert!(app.editor.buf.dirty);
-        assert_eq!(std::fs::read_to_string(&p).unwrap(), "abc\n");
-    }
-
-    #[test]
-    fn save_failure_keeps_dirty() {
-        let d = tempdir().unwrap();
-        let p = d.path().join("no-such-dir").join("a.txt");
-        let mut app = App::open(Some(p), None).unwrap();
-        typ(&mut app, "x");
-        app.dispatch(CommandId::Save);
-        assert!(
-            status(&app).starts_with("Save failed: "),
-            "{}",
-            status(&app)
-        );
-        assert!(app.editor.buf.dirty);
-        assert_eq!(title_state(&app), "Modified");
-    }
-
-    #[test]
-    fn save_unnamed_prompts_for_name() {
-        let d = tempdir().unwrap();
-        let mut app = App::from_buffer(Buffer::new_empty(LineEnding::Lf), None);
-        typ(&mut app, "hi");
-        app.dispatch(CommandId::Save);
-        match &app.prompt {
-            Some((Prompt::Text { label, input, .. }, _)) => {
-                assert_eq!(label, "File name: ");
-                assert!(input.is_empty());
-            }
-            _ => panic!("expected the name prompt"),
-        }
-        typ(&mut app, &d.path().join("notes").to_string_lossy());
-        app.handle_event(key(KeyCode::Enter, KeyModifiers::NONE));
-        let p = d.path().join("notes.txt");
-        assert!(app.prompt.is_none());
-        assert_eq!(std::fs::read_to_string(&p).unwrap(), "hi\n");
-        assert_eq!(app.path.as_deref(), Some(p.as_path()));
-        assert!(!app.editor.buf.dirty);
-    }
-
-    fn press(app: &mut App, c: char) {
-        app.handle_event(key(KeyCode::Char(c), KeyModifiers::NONE));
-    }
-
-    #[test]
-    fn quit_choice_no_cancel_and_clean() {
-        let d = tempdir().unwrap();
-        let (p, mut app) = existing(&d, "abc\n");
-        app.dispatch(CommandId::Quit);
-        assert!(app.quit, "clean buffer quits at once");
-
-        let mut app = App::open(Some(p.clone()), None).unwrap();
-        typ(&mut app, "x");
-        app.dispatch(CommandId::Quit);
-        press(&mut app, 'c');
-        assert!(app.prompt.is_none() && !app.quit);
-        app.dispatch(CommandId::Quit);
-        app.handle_event(key(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(app.prompt.is_none() && !app.quit);
-        app.dispatch(CommandId::Quit);
-        press(&mut app, 'n');
-        assert!(app.quit);
-        assert_eq!(std::fs::read_to_string(&p).unwrap(), "abc\n");
-    }
-
-    #[test]
-    fn quit_choice_yes_saves_then_quits() {
-        let d = tempdir().unwrap();
-        let (p, mut app) = existing(&d, "abc\n");
-        typ(&mut app, "x");
-        app.dispatch(CommandId::Quit);
-        press(&mut app, 'Y');
-        assert!(app.quit);
-        assert_eq!(std::fs::read_to_string(&p).unwrap(), "xabc\n");
-    }
-
-    #[test]
-    fn quit_choice_yes_failed_save_stays_open() {
-        let d = tempdir().unwrap();
-        let p = d.path().join("no-such-dir").join("a.txt");
-        let mut app = App::open(Some(p), None).unwrap();
-        typ(&mut app, "x");
-        app.dispatch(CommandId::Quit);
-        press(&mut app, 'y');
-        assert!(!app.quit);
-        assert!(status(&app).starts_with("Save failed: "));
-    }
-
-    #[test]
-    fn quit_choice_yes_unnamed_asks_name_then_quits() {
-        let d = tempdir().unwrap();
-        let mut app = App::from_buffer(Buffer::new_empty(LineEnding::Lf), None);
-        typ(&mut app, "hi");
-        app.dispatch(CommandId::Quit);
-        press(&mut app, 'y');
-        assert!(!app.quit);
-        assert!(matches!(app.prompt, Some((Prompt::Text { .. }, _))));
-        typ(&mut app, &d.path().join("n.md").to_string_lossy());
-        app.handle_event(key(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(app.quit);
-        assert_eq!(
-            std::fs::read_to_string(d.path().join("n.md")).unwrap(),
-            "hi\n"
-        );
-    }
-
-    fn pos(line: usize, col: usize) -> Pos {
-        Pos { line, col }
     }
 
     #[test]
@@ -822,47 +572,6 @@ mod tests {
         assert_eq!(status(&app), "Not available yet");
         app.handle_event(Event::Paste("1\r\n2".into()));
         assert_eq!(app.editor.buf.rope.to_string(), "ab\nd@Z1\n2");
-    }
-
-    #[test]
-    fn open_at_line_is_one_based_and_clamped() {
-        let d = tempdir().unwrap();
-        let p = d.path().join("a.txt");
-        std::fs::write(&p, "a\nb\nc\n").unwrap();
-        let at = |line| {
-            App::open(Some(p.clone()), Some(line))
-                .unwrap()
-                .editor
-                .cursor
-        };
-        assert_eq!(at(2), pos(1, 0));
-        assert_eq!(at(0), pos(0, 0));
-        assert_eq!(at(99), pos(2, 0));
-    }
-
-    fn open_err(p: PathBuf) -> String {
-        match App::open(Some(p), None) {
-            Ok(_) => panic!("expected an error"),
-            Err(e) => e.to_string(),
-        }
-    }
-
-    #[test]
-    fn open_rejects_directory_and_binary_untouched() {
-        let d = tempdir().unwrap();
-        let dir = d.path().join("sub");
-        std::fs::create_dir(&dir).unwrap();
-        assert_eq!(open_err(dir), "sub is a directory");
-        let bin = d.path().join("b.bin");
-        std::fs::write(&bin, b"a\0b").unwrap();
-        assert_eq!(open_err(bin.clone()), "b.bin is not a UTF-8 text file");
-        assert_eq!(std::fs::read(&bin).unwrap(), b"a\0b");
-        let big = d.path().join("big.txt");
-        std::fs::File::create(&big)
-            .unwrap()
-            .set_len(fileio::LARGE_FILE_BYTES + 1)
-            .unwrap();
-        assert_eq!(open_err(big), "big.txt is larger than 50 MB");
     }
 
     #[test]
@@ -897,129 +606,6 @@ mod tests {
         assert!(app.expire_status(at(4000)));
         assert_eq!(app.status_text(), None);
         assert!(!app.expire_status(at(5000)));
-    }
-
-    fn unnamed_with(text: &str) -> App {
-        let mut app = App::from_buffer(Buffer::new_empty(LineEnding::Lf), None);
-        typ(&mut app, text);
-        app
-    }
-
-    fn submit_name(app: &mut App, p: &std::path::Path) {
-        typ(app, &p.to_string_lossy());
-        app.handle_event(key(KeyCode::Enter, KeyModifiers::NONE));
-    }
-
-    #[test]
-    fn name_prompt_existing_file_asks_before_replacing() {
-        let d = tempdir().unwrap();
-        let p = d.path().join("old.txt");
-        std::fs::write(&p, "old").unwrap();
-        let mut app = unnamed_with("hi");
-        app.dispatch(CommandId::Save);
-        submit_name(&mut app, &p);
-        match &app.prompt {
-            Some((Prompt::Choice { label, keys }, _)) => {
-                assert_eq!(label, "old.txt exists. Replace? (y/N)");
-                assert_eq!(*keys, &['y', 'n']);
-            }
-            _ => panic!("expected the replace choice"),
-        }
-        assert_eq!(std::fs::read_to_string(&p).unwrap(), "old");
-        press(&mut app, 'y');
-        assert!(app.prompt.is_none());
-        assert_eq!(std::fs::read_to_string(&p).unwrap(), "hi\n");
-        assert!(!app.editor.buf.dirty);
-        assert_eq!(app.path.as_deref(), Some(p.as_path()));
-    }
-
-    #[test]
-    fn name_prompt_decline_keeps_file_and_dirty() {
-        let d = tempdir().unwrap();
-        let p = d.path().join("old.txt");
-        std::fs::write(&p, "old").unwrap();
-        let decline: [Event; 3] = [
-            key(KeyCode::Char('n'), KeyModifiers::NONE),
-            key(KeyCode::Esc, KeyModifiers::NONE),
-            key(KeyCode::Enter, KeyModifiers::NONE),
-        ];
-        for ev in decline {
-            let mut app = unnamed_with("hi");
-            app.dispatch(CommandId::Save);
-            submit_name(&mut app, &p);
-            app.handle_event(ev);
-            assert!(app.prompt.is_none());
-            assert_eq!(status(&app), "Not saved");
-            assert!(app.editor.buf.dirty);
-            assert!(app.path.is_none());
-            assert_eq!(std::fs::read_to_string(&p).unwrap(), "old");
-        }
-    }
-
-    #[test]
-    fn quit_yes_name_replace_yes_saves_and_quits() {
-        let d = tempdir().unwrap();
-        let p = d.path().join("old.txt");
-        std::fs::write(&p, "old").unwrap();
-        let mut app = unnamed_with("hi");
-        app.dispatch(CommandId::Quit);
-        press(&mut app, 'y');
-        submit_name(&mut app, &p);
-        assert!(!app.quit);
-        press(&mut app, 'y');
-        assert!(app.quit);
-        assert_eq!(std::fs::read_to_string(&p).unwrap(), "hi\n");
-    }
-
-    #[test]
-    fn name_prompt_existing_extensionless_not_renamed() {
-        let d = tempdir().unwrap();
-        let p = d.path().join("notes");
-        std::fs::write(&p, "old").unwrap();
-        let mut app = unnamed_with("hi");
-        app.dispatch(CommandId::Save);
-        submit_name(&mut app, &p);
-        press(&mut app, 'y');
-        assert_eq!(std::fs::read_to_string(&p).unwrap(), "hi\n");
-        assert!(!d.path().join("notes.txt").exists());
-        assert_eq!(app.path.as_deref(), Some(p.as_path()));
-    }
-
-    #[test]
-    fn name_prompt_new_extensionless_gets_txt() {
-        let d = tempdir().unwrap();
-        let mut app = unnamed_with("hi");
-        app.dispatch(CommandId::Save);
-        submit_name(&mut app, &d.path().join("todo"));
-        assert!(app.prompt.is_none());
-        let p = d.path().join("todo.txt");
-        assert_eq!(std::fs::read_to_string(&p).unwrap(), "hi\n");
-        assert!(!d.path().join("todo").exists());
-    }
-
-    #[test]
-    fn name_prompt_trailing_separator_rejected() {
-        let d = tempdir().unwrap();
-        let sub = d.path().join("sub");
-        std::fs::create_dir(&sub).unwrap();
-        let names = [
-            format!("{}/", sub.display()),
-            format!("{}\\", d.path().join("new").display()),
-            sub.display().to_string(),
-        ];
-        for name in names {
-            let mut app = unnamed_with("hi");
-            app.dispatch(CommandId::Save);
-            typ(&mut app, &name);
-            app.handle_event(key(KeyCode::Enter, KeyModifiers::NONE));
-            assert!(app.prompt.is_none(), "{name}");
-            assert_eq!(status(&app), "Not a file name", "{name}");
-            assert!(app.editor.buf.dirty);
-            assert!(app.path.is_none());
-        }
-        let left: Vec<_> = std::fs::read_dir(d.path()).unwrap().collect();
-        assert_eq!(left.len(), 1, "only sub/ remains");
-        assert_eq!(std::fs::read_dir(&sub).unwrap().count(), 0);
     }
 
     #[test]
@@ -1303,21 +889,6 @@ mod tests {
     }
 
     #[test]
-    fn save_marks_undo_save_point() {
-        let d = tempdir().unwrap();
-        let (_, mut app) = existing(
-            &d, "abc
-",
-        );
-        typ(&mut app, "x");
-        app.dispatch(CommandId::Save);
-        app.dispatch(CommandId::Undo);
-        assert!(app.editor.buf.dirty);
-        app.dispatch(CommandId::Redo);
-        assert!(!app.editor.buf.dirty);
-    }
-
-    #[test]
     fn paste_is_one_undo_step() {
         let d = tempdir().unwrap();
         let (_, mut app) = existing(
@@ -1363,35 +934,12 @@ three"
     }
 
     #[test]
-    fn new_unnamed_buffer_indent_is_four() {
-        let mut app = App::open(None, None).unwrap();
-        assert_eq!(app.editor.indent, Indent::Spaces(4));
-        app.handle_event(key(KeyCode::Tab, KeyModifiers::NONE));
-        assert_eq!(app.editor.buf.rope.to_string(), "    ");
-    }
-
-    #[test]
-    fn open_detects_indent_and_sets_tab_width() {
-        let d = tempdir().unwrap();
-        let (_, app) = existing(&d, "a:\n  b:\n    c\n");
-        assert_eq!(app.editor.indent, Indent::Spaces(2));
-        assert_eq!(app.viewport.tab_width, 2);
-        let (_, app) = existing(&d, "a\n\tb\n\tc\n");
-        assert_eq!(app.editor.indent, Indent::Tabs);
-        assert_eq!(app.viewport.tab_width, 4);
-    }
-
-    #[test]
     fn enter_and_tab_keys_use_smart_rules() {
         let mut app = App::open(None, None).unwrap();
         app.handle_event(key(KeyCode::Tab, KeyModifiers::NONE));
         typ(&mut app, "- a");
         app.handle_event(key(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(app.editor.buf.rope.to_string(), "    - a\n    - ");
-    }
-
-    fn ctrl(c: char) -> Event {
-        key(KeyCode::Char(c), KeyModifiers::CONTROL)
     }
 
     #[test]
@@ -1428,14 +976,5 @@ three"
         assert_eq!(app.editor.buf.rope.to_string(), "ZZZ ab");
         let vp = &app.viewport;
         assert_eq!((vp.hscroll, vp.hscroll_col, vp.hscroll_line), (0, 0, 0));
-    }
-
-    #[test]
-    fn quit_prompt_ctrl_n_does_not_quit() {
-        let mut app = App::from_buffer(Buffer::from_str_detect("abc"), None);
-        typ(&mut app, "x");
-        app.dispatch(CommandId::Quit);
-        app.handle_event(ctrl('n'));
-        assert!(app.prompt.is_some() && !app.quit);
     }
 }
