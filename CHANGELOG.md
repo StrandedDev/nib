@@ -2,7 +2,7 @@
 
 All notable changes to nib are listed here. Versions follow [Semantic Versioning](https://semver.org/).
 
-## [0.1.0] - Unreleased
+## [0.1.0] - 2026-10-28
 
 First release.
 
@@ -17,5 +17,7 @@ First release.
 - Recovery file for unsaved changes, and read-only opening when another nib has the file.
 - Warning before overwriting a file changed on disk; message screens for files nib cannot edit.
 - TOML config for settings and key overrides.
+- `--help` (`-h`) with examples, the main keys as configured, and the config and recovery paths;
+  `-V` for `--version`.
 - Release builds: `.deb`, `.rpm`, Linux tarball, Windows `.msi` and `.zip`, with install scripts
   for Linux and Windows.
