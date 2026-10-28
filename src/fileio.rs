@@ -14,6 +14,8 @@ pub enum Loaded {
     Text(Buffer),
     NotFound,
     Directory,
+    /// A FIFO, device or socket: reading it could block or never end.
+    NotRegular,
     Binary,
     TooLarge(u64),
 }
@@ -26,6 +28,9 @@ pub fn load(path: &Path, allow_large: bool) -> io::Result<Loaded> {
     };
     if meta.is_dir() {
         return Ok(Loaded::Directory);
+    }
+    if !meta.file_type().is_file() {
+        return Ok(Loaded::NotRegular);
     }
     if !allow_large && meta.len() > LARGE_FILE_BYTES {
         return Ok(Loaded::TooLarge(meta.len()));
@@ -161,6 +166,24 @@ pub fn is_writable(path: &Path) -> bool {
     ok
 }
 
+/// `N bytes` below 1 KB, else one decimal place (half up) in the largest
+/// 1024-based unit that keeps the number under 1024, up to TB.
+pub fn format_size(bytes: u64) -> String {
+    if bytes < 1024 {
+        return format!("{bytes} bytes");
+    }
+    let units = ["KB", "MB", "GB", "TB"];
+    let mut div: u128 = 1;
+    for (i, unit) in units.iter().enumerate() {
+        div *= 1024;
+        let tenths = (u128::from(bytes) * 10 + div / 2) / div;
+        if tenths < 10240 || i == units.len() - 1 {
+            return format!("{}.{} {unit}", tenths / 10, tenths % 10);
+        }
+    }
+    unreachable!("the last unit always returns")
+}
+
 pub fn format_mtime(t: SystemTime) -> String {
     jiff::Timestamp::try_from(t)
         .map(|ts| {
@@ -204,6 +227,20 @@ mod tests {
     fn load_dir() {
         let d = tempdir().unwrap();
         assert!(matches!(load(d.path(), false).unwrap(), Loaded::Directory));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_rejects_fifo() {
+        let d = tempdir().unwrap();
+        let p = d.path().join("f");
+        let made = std::process::Command::new("mkfifo").arg(&p).status();
+        if !made.is_ok_and(|s| s.success()) {
+            eprintln!("mkfifo not available; skipped");
+            return;
+        }
+        // Opening a FIFO would block until a writer comes along.
+        assert!(matches!(load(&p, false).unwrap(), Loaded::NotRegular));
     }
 
     #[test]
@@ -398,6 +435,19 @@ mod tests {
         perm.set_readonly(false);
         fs::set_permissions(&p, perm).unwrap();
         assert!(!is_writable(&d.path().join("no-such-dir").join("f")));
+    }
+
+    #[test]
+    fn size_format() {
+        assert_eq!(format_size(2_254_857_830), "2.1 GB");
+        assert_eq!(format_size(52_428_800), "50.0 MB");
+        assert_eq!(format_size(1536), "1.5 KB");
+        assert_eq!(format_size(1023), "1023 bytes");
+        assert_eq!(format_size(1024), "1.0 KB");
+        // Rounding up into the next unit names that unit.
+        assert_eq!(format_size(1024 * 1024 - 1), "1.0 MB");
+        assert_eq!(format_size(1536 * 1024 * 1024 * 1024), "1.5 TB");
+        assert_eq!(format_size(u64::MAX), "16777216.0 TB");
     }
 
     #[test]

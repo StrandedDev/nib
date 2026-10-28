@@ -27,7 +27,7 @@ const CONTROL_MARK: &str = "\u{b7}";
 
 /// Bright black foreground (SGR 90), one of the 16 ANSI colours. crossterm
 /// writes `Color::DarkGrey` as 256-colour index 8, which nib does not use.
-struct MarkColour;
+pub(crate) struct MarkColour;
 
 impl Command for MarkColour {
     fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
@@ -404,7 +404,7 @@ fn title_bar(w: usize, name: &str, state: &str) -> String {
 }
 
 /// Control chars replaced by a visible mark.
-fn clean(s: &str) -> String {
+pub(crate) fn clean(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_control() { '\u{b7}' } else { c })
         .collect()
@@ -426,7 +426,7 @@ fn fit_right(s: &str, max: usize) -> String {
 
 /// `s` cut from the left to at most `max` cells, with `mark` in front when
 /// anything was cut.
-fn fit_left(s: &str, max: usize, mark: &str) -> String {
+pub(crate) fn fit_left(s: &str, max: usize, mark: &str) -> String {
     if s.width() <= max {
         return s.to_string();
     }

@@ -326,6 +326,11 @@ impl Recovery {
         None
     }
 
+    /// The buffer is a read-only copy of a file another nib owns.
+    pub fn is_shared(&self) -> bool {
+        self.shared
+    }
+
     /// Clean exit or leaving the buffer: no recovery file, no lock.
     pub fn close(&mut self) {
         self.discard();

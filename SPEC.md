@@ -59,7 +59,8 @@ regex search · multiple buffers/tabs · block selection · multiple cursors · 
   `:N` suffix included. A missing file gives an empty `New File` buffer, created on first save.
   Opening resets undo history, cursor, scroll, indent detection and any find. A file nib cannot
   edit leaves the current buffer untouched and says why in the status line:
-  `<name> is not a UTF-8 text file`, `<name> is a directory`, `<name> is larger than 50 MB`.
+  `<name> is not a UTF-8 text file`, `<name> is a directory`, `<name> is not a regular file`.
+  A file over 50 MB asks first, as at startup; N or Esc keeps the current buffer.
 - **Save As** asks `Save as: ` prefilled with the current path (empty when unnamed), with the same
   name rules and `<name> exists. Replace? (y/N)` confirm as the first-save prompt; the buffer's own
   path needs no confirm. On success the buffer takes the new path and keeps its undo history.
@@ -128,19 +129,22 @@ so Ctrl+S / Ctrl+Q reach nib.
   - Save As onto a file another running nib has open is refused with `<name> is open in another nib (pid N)`; the buffer stays modified and nothing is written.
   - These two prompts are the only choices where Enter means yes.
   - Unnamed buffers are never offered at startup (there is no path to match); their `untitled-*.rec` files stay on disk after a crash for manual recovery.
-- **External change:** detected before save; user is warned.
+- **External change:** detected before save: if the file's modification time differs from when
+  it was read or last saved, Save asks `File changed on disk — overwrite? (y/N)`; Y writes, N, Esc
+  or Enter say `Not saved` and keep the buffer modified. Save As to another path does not ask.
 - **Panic:** a panic hook restores the terminal (raw mode off, main screen back) before exit.
 
 ### Error behaviour
 
 | Situation | Behaviour |
 |---|---|
-| Binary or non-UTF-8 file | Message screen; exit on Enter / Space / Esc. File untouched. |
-| Path is a directory | Same as above. |
-| File > 50 MB | `File is 2.1 GB — open anyway? (y/N)` |
+| Binary or non-UTF-8 file | Message screen (at startup): `<name> is not a UTF-8 text file`, centred; exit (code 0) on Enter / Space / Esc. File untouched. |
+| Path is a directory | Same as above, with `<name> is a directory`. |
+| FIFO, device or socket | Same as above, with `<name> is not a regular file`; it is never read. |
+| File > 50 MB | `File is 2.1 GB — open anyway? (y/N)` (1 decimal, KB/MB/GB/TB with 1024 base). N or Esc at startup exits (code 0). |
 | Already open in another nib | `already open in another nib (pid N) — open read-only? (Y/n)`; see Recovery file above. |
-| No write permission | `[Read-only]` in title; editing allowed; save fails with message; Save As works. No built-in sudo. |
-| Disk full / write error | Original untouched; error shown; buffer and recovery file kept. |
+| No write permission | `[Read-only]` in title; editing allowed; Save says `Cannot save: permission denied — use Save As`; Save As works. Permission is checked again on Save, so a fixed file saves. No built-in sudo. |
+| Disk full / write error | Original untouched; `Save failed: <error>`; buffer and recovery file kept. |
 | File deleted while open | Save recreates it. |
 | Broken config | Defaults used; warning in status line. |
 

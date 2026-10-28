@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 
 use crate::app::{App, PromptPurpose};
 use crate::buffer::{Buffer, LineEnding};
@@ -32,11 +32,18 @@ pub(crate) enum FileFlow {
         path: PathBuf,
         then: Then,
     },
+    /// `File changed on disk — overwrite? (y/N)`
+    ExternalChange {
+        path: PathBuf,
+        then: Then,
+    },
     OpenName,
     /// `already open in another nib …? (Y/n)`
     ReadOnly(PendingOpen),
     /// `Recover unsaved changes from …? (Y/n)`
     Recover(PendingOpen),
+    /// `File is 2.1 GB — open anyway? (y/N)`
+    TooLarge(PendingOpen),
 }
 
 /// An open waiting on a recovery or lock question.
@@ -73,10 +80,43 @@ impl App {
         let mut app = App::from_buffer(Buffer::new_empty(LineEnding::Lf), None);
         app.recovery = recovery;
         if let Some(path) = path {
-            let (buf, is_new) = read_for_edit(&path)?;
-            app.open_checked(buf, is_new, path, line, true);
+            app.open_path(path, line, true, false)?;
         }
         Ok(app)
+    }
+
+    /// Reads `path` and opens it. A file nib cannot edit gets the message
+    /// screen at startup (before any lock or recovery check) and a status
+    /// message on Open; one over the size limit asks first.
+    fn open_path(
+        &mut self,
+        path: PathBuf,
+        line: Option<usize>,
+        startup: bool,
+        allow_large: bool,
+    ) -> Result<()> {
+        match read_for_edit(&path, allow_large)? {
+            Opened::Edit(buf, is_new) => self.open_checked(buf, is_new, path, line, startup),
+            Opened::Refused(why) if startup => self.message = Some(why),
+            Opened::Refused(why) => self.set_status(&why),
+            Opened::TooLarge(bytes) => {
+                let p = Prompt::Choice {
+                    label: format!(
+                        "File is {} \u{2014} open anyway? (y/N)",
+                        fileio::format_size(bytes)
+                    ),
+                    keys: &['y', 'n'],
+                    default: None,
+                };
+                let pending = PendingOpen {
+                    path,
+                    line,
+                    startup,
+                };
+                self.ask(p, FileFlow::TooLarge(pending));
+            }
+        }
+        Ok(())
     }
 
     /// Opens `path`, unless another nib has it or a crash left changes for
@@ -165,9 +205,8 @@ impl App {
         }
         let (path, line) = cli::resolve(raw, |p| p.exists());
         let path = std::path::absolute(&path).unwrap_or(path);
-        match read_for_edit(&path) {
-            Ok((buf, is_new)) => self.open_checked(buf, is_new, path, line, false),
-            Err(e) => self.set_status(&format!("{e:#}")),
+        if let Err(e) = self.open_path(path, line, false, false) {
+            self.set_status(&format!("{e:#}"));
         }
     }
 
@@ -175,7 +214,7 @@ impl App {
     /// the buffer is now saved; `then` runs after a save from the name prompt.
     pub(crate) fn save(&mut self, then: Then) -> bool {
         match self.path.clone() {
-            Some(path) => self.save_to(path),
+            Some(path) => self.save_to(path, then),
             None => {
                 let p = Prompt::text("File name: ");
                 self.ask(p, FileFlow::SaveName { then });
@@ -202,9 +241,18 @@ impl App {
         self.prompt = Some((p, PromptPurpose::File(flow)));
     }
 
-    fn save_to(&mut self, path: PathBuf) -> bool {
+    /// Saves to `path` unless it is not writable or, for the buffer's own
+    /// file, changed on disk since it was read: that is asked first, and
+    /// `then` runs after a yes.
+    fn save_to(&mut self, path: PathBuf, then: Then) -> bool {
+        let own = self.path.as_ref() == Some(&path);
         // Save As to another file asks about that file, not this one.
-        let read_only = if self.path.as_ref() == Some(&path) {
+        let read_only = if own {
+            // Permissions may have been fixed, or a lock released, since the
+            // file was opened. Another nib's copy stays read-only.
+            if self.read_only && !self.recovery.is_shared() && fileio::is_writable(&path) {
+                self.read_only = false;
+            }
             self.read_only
         } else {
             path.exists() && !fileio::is_writable(&path)
@@ -213,6 +261,22 @@ impl App {
             self.set_status("Cannot save: permission denied \u{2014} use Save As");
             return false;
         }
+        // A file that is gone is simply written again.
+        let on_disk = fileio::mtime(&path);
+        if own && on_disk.is_some() && on_disk != self.disk_mtime {
+            let p = Prompt::Choice {
+                label: "File changed on disk \u{2014} overwrite? (y/N)".to_string(),
+                keys: &['y', 'n'],
+                default: None,
+            };
+            self.ask(p, FileFlow::ExternalChange { path, then });
+            return false;
+        }
+        self.write_to(path)
+    }
+
+    /// Writes the buffer to `path` and makes it the buffer's file.
+    fn write_to(&mut self, path: PathBuf) -> bool {
         if let Err(e) = fileio::atomic_write(&path, &self.editor.buf.to_bytes()) {
             self.set_status(&format!("Save failed: {e}"));
             return false;
@@ -268,9 +332,18 @@ impl App {
                 self.save_named(&name, then);
             }
             (FileFlow::ConfirmReplace { path, then }, PromptResult::Choice('y')) => {
-                self.save_then(path, then);
+                if !self.owned_elsewhere(&path) {
+                    self.save_then(path, then);
+                }
             }
-            (FileFlow::ConfirmReplace { .. }, _) => self.set_status("Not saved"),
+            (FileFlow::ExternalChange { path, then }, PromptResult::Choice('y')) => {
+                if !self.owned_elsewhere(&path) && self.write_to(path) {
+                    self.proceed(then);
+                }
+            }
+            (FileFlow::ConfirmReplace { .. } | FileFlow::ExternalChange { .. }, _) => {
+                self.set_status("Not saved")
+            }
             (FileFlow::SaveChoice { then }, PromptResult::Choice('y')) => {
                 if self.save(then) {
                     self.proceed(then);
@@ -311,16 +384,30 @@ impl App {
                     }
                 }
             }
-            // N to read-only, and Esc to either, cancel the open.
-            (FileFlow::ReadOnly(o) | FileFlow::Recover(o), _) => self.cancel_open(o.startup),
+            (FileFlow::TooLarge(o), PromptResult::Choice('y')) => {
+                if let Err(e) = self.open_path(o.path, o.line, o.startup, true) {
+                    self.set_status(&format!("{e:#}"));
+                    self.cancel_open(o.startup);
+                }
+            }
+            // N to read-only or too large, and Esc to any, cancel the open.
+            (FileFlow::ReadOnly(o) | FileFlow::Recover(o) | FileFlow::TooLarge(o), _) => {
+                self.cancel_open(o.startup)
+            }
             _ => {}
         }
     }
 
     /// Loads a file again after a prompt; it may have changed meanwhile.
+    /// A large file only gets here after the size question was answered.
     fn reread(&mut self, path: &Path) -> Option<(Buffer, bool)> {
-        match read_for_edit(path) {
-            Ok(r) => Some(r),
+        match read_for_edit(path, true) {
+            Ok(Opened::Edit(buf, is_new)) => Some((buf, is_new)),
+            Ok(Opened::Refused(why)) => {
+                self.set_status(&why);
+                None
+            }
+            Ok(Opened::TooLarge(_)) => unreachable!("read with allow_large"),
             Err(e) => {
                 self.set_status(&format!("{e:#}"));
                 None
@@ -354,10 +441,7 @@ impl App {
             self.set_status("Not a file name");
             return;
         }
-        // Two nibs writing one file is what the lock is there to prevent.
-        if let Check::Owned(pid) = self.recovery.check(&path) {
-            let name = file_name(&path);
-            self.set_status(&format!("{name} is open in another nib (pid {pid})"));
+        if self.owned_elsewhere(&path) {
             return;
         }
         // Saving over the buffer's own file is just a save.
@@ -373,25 +457,47 @@ impl App {
         }
     }
 
+    /// Two nibs writing one file is what the lock is there to prevent. Asked
+    /// again after every yes: another nib may have opened it meanwhile.
+    fn owned_elsewhere(&mut self, path: &Path) -> bool {
+        match self.recovery.check(path) {
+            Check::Owned(pid) => {
+                let name = file_name(path);
+                self.set_status(&format!("{name} is open in another nib (pid {pid})"));
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn save_then(&mut self, path: PathBuf, then: Then) {
-        if self.save_to(path) {
+        if self.save_to(path, then) {
             self.proceed(then);
         }
     }
 }
 
-/// The buffer for `path` and whether it is a new file. Text that nib cannot
-/// edit is an error naming the file.
-fn read_for_edit(path: &Path) -> Result<(Buffer, bool)> {
+/// What reading a file for editing found.
+enum Opened {
+    /// The buffer and whether it is a new file.
+    Edit(Buffer, bool),
+    /// Not something nib can edit; the reason names the file.
+    Refused(String),
+    /// Over the size limit, in bytes: opened only after asking.
+    TooLarge(u64),
+}
+
+fn read_for_edit(path: &Path, allow_large: bool) -> Result<Opened> {
     let name = file_name(path);
-    let loaded = fileio::load(path, false).with_context(|| format!("cannot open {name}"))?;
-    match loaded {
-        Loaded::Text(b) => Ok((b, false)),
-        Loaded::NotFound => Ok((Buffer::new_empty(LineEnding::Lf), true)),
-        Loaded::Binary => bail!("{name} is not a UTF-8 text file"),
-        Loaded::Directory => bail!("{name} is a directory"),
-        Loaded::TooLarge(_) => bail!("{name} is larger than 50 MB"),
-    }
+    let loaded = fileio::load(path, allow_large).with_context(|| format!("cannot open {name}"))?;
+    Ok(match loaded {
+        Loaded::Text(b) => Opened::Edit(b, false),
+        Loaded::NotFound => Opened::Edit(Buffer::new_empty(LineEnding::Lf), true),
+        Loaded::Binary => Opened::Refused(format!("{name} is not a UTF-8 text file")),
+        Loaded::Directory => Opened::Refused(format!("{name} is a directory")),
+        Loaded::NotRegular => Opened::Refused(format!("{name} is not a regular file")),
+        Loaded::TooLarge(n) => Opened::TooLarge(n),
+    })
 }
 
 /// Last path component for display, or the whole path when it has none.
@@ -450,7 +556,7 @@ mod tests {
     }
 
     #[test]
-    fn save_read_only_fails_and_stays_dirty() {
+    fn read_only_save_message() {
         let d = tempdir().unwrap();
         let p = d.path().join("ro.txt");
         std::fs::write(&p, "abc\n").unwrap();
@@ -583,29 +689,50 @@ mod tests {
         assert_eq!(at(99), pos(2, 0));
     }
 
-    fn open_err(p: PathBuf) -> String {
-        match App::open(Some(p), None) {
-            Ok(_) => panic!("expected an error"),
-            Err(e) => e.to_string(),
+    /// Just over the 50 MB limit, and text, so it opens once allowed.
+    fn big_text(d: &tempfile::TempDir) -> PathBuf {
+        let p = d.path().join("big.txt");
+        std::fs::write(&p, "abcdefghi\n".repeat(5_242_881)).unwrap();
+        p
+    }
+
+    const BIG: &str = "File is 50.0 MB \u{2014} open anyway? (y/N)";
+
+    #[test]
+    fn too_large_prompts_at_startup() {
+        let d = tempdir().unwrap();
+        let p = big_text(&d);
+        let mut app = App::open(Some(p.clone()), Some(2)).unwrap();
+        assert_eq!(prompt_label(&app), BIG);
+        assert!(app.path.is_none());
+        press(&mut app, 'y');
+        assert!(app.prompt.is_none() && !app.quit);
+        assert_eq!(app.path.as_deref(), Some(p.as_path()));
+        assert_eq!(app.editor.cursor, pos(1, 0));
+        assert_eq!(app.editor.buf.to_bytes().len(), 52_428_810);
+        for c in [KeyCode::Char('n'), KeyCode::Esc, KeyCode::Enter] {
+            let mut app = App::open(Some(p.clone()), None).unwrap();
+            app.handle_event(key(c, KeyModifiers::NONE));
+            assert!(app.quit, "{c:?}");
         }
     }
 
     #[test]
-    fn open_rejects_directory_and_binary_untouched() {
+    fn too_large_prompts_on_open() {
         let d = tempdir().unwrap();
-        let dir = d.path().join("sub");
-        std::fs::create_dir(&dir).unwrap();
-        assert_eq!(open_err(dir), "sub is a directory");
-        let bin = d.path().join("b.bin");
-        std::fs::write(&bin, b"a\0b").unwrap();
-        assert_eq!(open_err(bin.clone()), "b.bin is not a UTF-8 text file");
-        assert_eq!(std::fs::read(&bin).unwrap(), b"a\0b");
-        let big = d.path().join("big.txt");
-        std::fs::File::create(&big)
-            .unwrap()
-            .set_len(fileio::LARGE_FILE_BYTES + 1)
-            .unwrap();
-        assert_eq!(open_err(big), "big.txt is larger than 50 MB");
+        let (a, mut app) = existing(&d, "abc\n");
+        let big = big_text(&d);
+        app.handle_event(ctrl('o'));
+        submit_name(&mut app, &big);
+        assert_eq!(prompt_label(&app), BIG);
+        press(&mut app, 'n');
+        assert!(app.prompt.is_none() && !app.quit);
+        assert_eq!(app.path.as_deref(), Some(a.as_path()));
+        assert_eq!(app.editor.buf.rope.to_string(), "abc");
+        app.handle_event(ctrl('o'));
+        submit_name(&mut app, &big);
+        press(&mut app, 'y');
+        assert_eq!(app.path.as_deref(), Some(big.as_path()));
     }
 
     #[test]
@@ -864,15 +991,9 @@ mod tests {
         std::fs::create_dir(&sub).unwrap();
         let bin = d.path().join("b.bin");
         std::fs::write(&bin, b"a\0b").unwrap();
-        let big = d.path().join("big.txt");
-        std::fs::File::create(&big)
-            .unwrap()
-            .set_len(fileio::LARGE_FILE_BYTES + 1)
-            .unwrap();
         let cases = [
             (bin.clone(), "b.bin is not a UTF-8 text file"),
             (sub, "sub is a directory"),
-            (big, "big.txt is larger than 50 MB"),
         ];
         for (p, msg) in cases {
             app.handle_event(ctrl('o'));
@@ -1024,6 +1145,200 @@ mod tests {
         save_as(&mut app, &d.path().join("sub/"));
         assert_eq!(status(&app), "Not a file name");
         assert_eq!(app.path.as_deref(), Some(b.as_path()));
+    }
+
+    /// Another program rewrites `p`. The mtime is set by hand: two writes in
+    /// one clock tick can share one.
+    fn change_on_disk(p: &Path, text: &str) {
+        std::fs::write(p, text).unwrap();
+        let t = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        let f = std::fs::File::options().write(true).open(p).unwrap();
+        f.set_modified(t).unwrap();
+    }
+
+    const CHANGED: &str = "File changed on disk \u{2014} overwrite? (y/N)";
+
+    #[test]
+    fn external_change_prompts() {
+        let d = tempdir().unwrap();
+        let (p, mut app) = existing(&d, "abc\n");
+        typ(&mut app, "x");
+        change_on_disk(&p, "theirs\n");
+        app.dispatch(CommandId::Save);
+        assert_eq!(prompt_label(&app), CHANGED);
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "theirs\n");
+        press(&mut app, 'y');
+        assert!(app.prompt.is_none());
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "xabc\n");
+        assert!(!app.editor.buf.dirty);
+        assert_eq!(app.disk_mtime, fileio::mtime(&p));
+        // The refreshed mtime means the next save asks nothing.
+        typ(&mut app, "y");
+        app.dispatch(CommandId::Save);
+        assert!(app.prompt.is_none());
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "xyabc\n");
+    }
+
+    #[test]
+    fn external_change_decline_keeps_dirty() {
+        let d = tempdir().unwrap();
+        for c in [KeyCode::Char('n'), KeyCode::Esc, KeyCode::Enter] {
+            let (p, mut app) = existing(&d, "abc\n");
+            typ(&mut app, "x");
+            change_on_disk(&p, "theirs\n");
+            app.dispatch(CommandId::Save);
+            app.handle_event(key(c, KeyModifiers::NONE));
+            assert!(app.prompt.is_none(), "{c:?}");
+            assert_eq!(status(&app), "Not saved");
+            assert!(app.editor.buf.dirty);
+            assert_eq!(std::fs::read_to_string(&p).unwrap(), "theirs\n");
+        }
+    }
+
+    #[test]
+    fn external_change_preserves_then_quit() {
+        let d = tempdir().unwrap();
+        let (p, mut app) = existing(&d, "abc\n");
+        typ(&mut app, "x");
+        change_on_disk(&p, "theirs\n");
+        app.dispatch(CommandId::Quit);
+        press(&mut app, 'y');
+        assert_eq!(prompt_label(&app), CHANGED);
+        press(&mut app, 'n');
+        assert!(!app.quit && app.editor.buf.dirty);
+        app.dispatch(CommandId::Quit);
+        press(&mut app, 'y');
+        press(&mut app, 'y');
+        assert!(app.quit);
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "xabc\n");
+        // Ctrl+O goes on to the name prompt the same way.
+        let (p, mut app) = existing(&d, "abc\n");
+        typ(&mut app, "x");
+        change_on_disk(&p, "theirs\n");
+        app.handle_event(ctrl('o'));
+        press(&mut app, 'y');
+        press(&mut app, 'y');
+        assert_eq!(prompt_label(&app), "Open: ");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "xabc\n");
+    }
+
+    #[test]
+    fn save_as_skips_external_check() {
+        let d = tempdir().unwrap();
+        let (a, mut app) = existing(&d, "abc\n");
+        typ(&mut app, "x");
+        change_on_disk(&a, "theirs\n");
+        let b = d.path().join("b.txt");
+        save_as(&mut app, &b);
+        assert!(app.prompt.is_none());
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "xabc\n");
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "theirs\n");
+        assert_eq!(app.disk_mtime, fileio::mtime(&b));
+    }
+
+    #[test]
+    fn deleted_file_save_recreates() {
+        let d = tempdir().unwrap();
+        let (p, mut app) = existing(&d, "abc\n");
+        std::fs::remove_file(&p).unwrap();
+        typ(&mut app, "x");
+        app.dispatch(CommandId::Save);
+        assert!(app.prompt.is_none());
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "xabc\n");
+        assert!(!app.editor.buf.dirty);
+        assert_eq!(app.disk_mtime, fileio::mtime(&p));
+    }
+
+    /// Another running nib (pid 4242) takes `p` while a prompt is open.
+    fn taken_by_other_nib(d: &tempfile::TempDir, p: &Path) {
+        let lock = crate::recovery::lock_path(&d.path().join("rec"), p);
+        crate::recovery::write(&lock, 4242, Some(p), b"").unwrap();
+    }
+
+    fn open_with_recovery(d: &tempfile::TempDir, p: &Path) -> App {
+        let rec = Recovery::new(d.path().join("rec"), |pid| pid == 4242);
+        App::open_with(Some(p.to_path_buf()), None, rec).unwrap()
+    }
+
+    #[test]
+    fn replace_confirm_rechecks_owner() {
+        let d = tempdir().unwrap();
+        let a = d.path().join("a.txt");
+        std::fs::write(&a, "abc\n").unwrap();
+        let mut app = open_with_recovery(&d, &a);
+        typ(&mut app, "x");
+        let b = d.path().join("b.txt");
+        std::fs::write(&b, "theirs\n").unwrap();
+        save_as(&mut app, &b);
+        assert_eq!(prompt_label(&app), "b.txt exists. Replace? (y/N)");
+        taken_by_other_nib(&d, &b);
+        press(&mut app, 'y');
+        assert_eq!(status(&app), "b.txt is open in another nib (pid 4242)");
+        assert!(app.editor.buf.dirty);
+        assert_eq!(app.path.as_deref(), Some(a.as_path()));
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "theirs\n");
+    }
+
+    #[test]
+    fn external_change_confirm_rechecks_owner() {
+        let d = tempdir().unwrap();
+        let a = d.path().join("a.txt");
+        std::fs::write(&a, "abc\n").unwrap();
+        let mut app = open_with_recovery(&d, &a);
+        typ(&mut app, "x");
+        change_on_disk(&a, "theirs\n");
+        app.dispatch(CommandId::Save);
+        assert_eq!(prompt_label(&app), CHANGED);
+        taken_by_other_nib(&d, &a);
+        press(&mut app, 'y');
+        assert_eq!(status(&app), "a.txt is open in another nib (pid 4242)");
+        assert!(app.editor.buf.dirty);
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "theirs\n");
+    }
+
+    #[test]
+    fn write_error_keeps_dirty() {
+        let d = tempdir().unwrap();
+        let sub = d.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let p = sub.join("a.txt");
+        std::fs::write(&p, "abc\n").unwrap();
+        let mut app = open_with_recovery(&d, &p);
+        typ(&mut app, "x");
+        assert!(!app.tick(std::time::Instant::now()));
+        let rec = crate::recovery::rec_path(&d.path().join("rec"), Some(&p), 0);
+        assert!(rec.exists());
+        // The directory goes, so the temp file cannot be created.
+        std::fs::remove_dir_all(&sub).unwrap();
+        app.dispatch(CommandId::Save);
+        assert!(
+            status(&app).starts_with("Save failed: "),
+            "{}",
+            status(&app)
+        );
+        assert!(app.editor.buf.dirty);
+        assert_eq!(title_state(&app), "Modified");
+        assert!(rec.exists());
+    }
+
+    #[test]
+    fn read_only_rechecked_on_save() {
+        let d = tempdir().unwrap();
+        let p = d.path().join("ro.txt");
+        std::fs::write(&p, "abc\n").unwrap();
+        set_readonly(&p, true);
+        let mut app = App::open(Some(p.clone()), None).unwrap();
+        set_readonly(&p, false);
+        if !app.read_only {
+            // root on unix can write anyway
+            return;
+        }
+        typ(&mut app, "x");
+        app.dispatch(CommandId::Save);
+        assert_eq!(status(&app), "");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "xabc\n");
+        assert!(!app.read_only && !app.editor.buf.dirty);
+        assert!(!title_state(&app).contains("[Read-only]"));
     }
 
     #[test]

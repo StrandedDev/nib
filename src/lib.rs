@@ -15,5 +15,6 @@ pub mod palette;
 pub mod prompt;
 pub mod recovery;
 pub mod render;
+mod screens;
 pub mod terminal;
 pub mod undo;

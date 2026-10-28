@@ -24,6 +24,7 @@ use crate::palette::Palette;
 use crate::prompt::{Prompt, PromptResult};
 use crate::recovery::Recovery;
 use crate::render::{self, AppView, PaletteView};
+use crate::screens;
 use crate::terminal::Guard;
 
 pub struct App {
@@ -51,6 +52,9 @@ pub struct App {
     pub(crate) recovery: Recovery,
     /// Why nib left before opening anything, for stderr.
     pub(crate) exit_note: Option<String>,
+    /// Shown full screen instead of the editor: the file named at startup
+    /// cannot be edited.
+    pub(crate) message: Option<String>,
 }
 
 /// What the open prompt is for.
@@ -103,7 +107,9 @@ impl App {
         let mut out = io::BufWriter::with_capacity(1 << 16, io::stdout().lock());
         let mut redraw = true;
         while !self.quit {
-            if redraw {
+            if let (true, Some(msg)) = (redraw, &self.message) {
+                screens::draw(&mut out, self.screen, msg)?;
+            } else if redraw {
                 render::draw(&mut out, &self.view())?;
                 // After the frame, so it cannot land in the middle of one.
                 if let Some(seq) = self.clip.take_pending() {
@@ -426,6 +432,14 @@ impl App {
     }
 
     pub(crate) fn handle_event(&mut self, ev: Event) {
+        if self.message.is_some() {
+            match ev {
+                Event::Key(key) => self.quit |= screens::exits(&key),
+                Event::Resize(w, h) => self.screen = (w, h),
+                _ => {}
+            }
+            return;
+        }
         match ev {
             Event::Key(key) if key.kind != KeyEventKind::Release => {
                 if self.palette.is_some() {
@@ -540,6 +554,7 @@ impl App {
             line_numbers: false,
             recovery: Recovery::disabled(),
             exit_note: None,
+            message: None,
         }
     }
 }
