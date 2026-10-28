@@ -7,12 +7,12 @@ use crossterm::{
     cursor::{Hide, MoveTo},
     event::{KeyCode, KeyEvent, KeyEventKind},
     queue,
-    style::{Print, ResetColor},
+    style::Print,
     terminal::{Clear, ClearType},
 };
 use unicode_width::UnicodeWidthStr;
 
-use crate::render::{MarkColour, clean, fit_left};
+use crate::render::{MarkColour, ResetFg, clean, fit_left};
 
 const HINT: &str = "Press Enter to exit";
 
@@ -34,7 +34,7 @@ pub(crate) fn draw(out: &mut impl Write, (w, h): (u16, u16), msg: &str) -> io::R
             MoveTo(centre(&hint, width), y + 2),
             MarkColour,
             Print(&hint),
-            ResetColor
+            ResetFg
         )?;
     }
     out.flush()
@@ -58,6 +58,17 @@ mod tests {
 
     use crate::app::App;
     use crate::app::test_support::*;
+
+    #[test]
+    fn hint_colour_reset_with_raw_sgr() {
+        let mut out = Vec::new();
+        super::draw(&mut out, (40, 5), "msg").unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(
+            out.contains("\u{1b}[90mPress Enter to exit\u{1b}[39m"),
+            "{out:?}"
+        );
+    }
 
     #[test]
     fn binary_screen_exits_on_space() {

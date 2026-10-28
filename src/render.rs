@@ -8,7 +8,7 @@ use crossterm::{
     Command,
     cursor::{Hide, MoveTo, Show},
     queue,
-    style::{Attribute, Color, Print, SetAttribute, SetForegroundColor},
+    style::{Attribute, Print, SetAttribute},
     terminal::{Clear, ClearType},
 };
 use unicode_segmentation::UnicodeSegmentation;
@@ -33,6 +33,22 @@ pub(crate) struct MarkColour;
 impl Command for MarkColour {
     fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
         f.write_str("[90m")
+    }
+
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Resets the foreground to the terminal default with a raw SGR 39.
+/// crossterm's `Color::Reset` and `ResetColor` are not used: with `NO_COLOR`
+/// set, crossterm drops the colour code and writes a bare `ESC [ m`.
+pub(crate) struct ResetFg;
+
+impl Command for ResetFg {
+    fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
+        Fg(FG_DEFAULT).write_ansi(f)
     }
 
     #[cfg(windows)]
@@ -273,12 +289,7 @@ fn draw_gutter(out: &mut impl Write, row: &Row, width: u16) -> io::Result<usize>
     }
     if row.start_col == 0 {
         let n = format!("{:>w$} ", row.line + 1, w = width - 1);
-        queue!(
-            out,
-            MarkColour,
-            Print(fit_right(&n, width)),
-            SetForegroundColor(Color::Reset)
-        )?;
+        queue!(out, MarkColour, Print(fit_right(&n, width)), ResetFg)?;
     } else {
         queue!(out, Print(" ".repeat(width)))?;
     }
