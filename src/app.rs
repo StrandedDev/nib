@@ -1429,4 +1429,13 @@ three"
         let vp = &app.viewport;
         assert_eq!((vp.hscroll, vp.hscroll_col, vp.hscroll_line), (0, 0, 0));
     }
+
+    #[test]
+    fn quit_prompt_ctrl_n_does_not_quit() {
+        let mut app = App::from_buffer(Buffer::from_str_detect("abc"), None);
+        typ(&mut app, "x");
+        app.dispatch(CommandId::Quit);
+        app.handle_event(ctrl('n'));
+        assert!(app.prompt.is_some() && !app.quit);
+    }
 }

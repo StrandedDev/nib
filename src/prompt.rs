@@ -33,6 +33,14 @@ impl Prompt {
         }
         match self {
             Prompt::Choice { keys, .. } => match key.code {
+                // Ctrl+A and the like are shortcuts, not answers.
+                KeyCode::Char(_)
+                    if key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    PromptResult::Pending
+                }
                 KeyCode::Char(c) => {
                     let c = c.to_ascii_lowercase();
                     if keys.contains(&c) {
@@ -179,5 +187,19 @@ mod tests {
             keys: &['y', 'n'],
         };
         assert_eq!(p.handle_key(&key(KeyCode::Enter)), PromptResult::Cancel);
+    }
+
+    #[test]
+    fn choice_ignores_ctrl_letter() {
+        let mut p = Prompt::Choice {
+            label: "Replace?".into(),
+            keys: &['a', 'r'],
+        };
+        let ctrl_a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL);
+        let alt_r = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT);
+        assert_eq!(p.handle_key(&ctrl_a), PromptResult::Pending);
+        assert_eq!(p.handle_key(&alt_r), PromptResult::Pending);
+        let shift_a = KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT);
+        assert_eq!(p.handle_key(&shift_a), PromptResult::Choice('a'));
     }
 }

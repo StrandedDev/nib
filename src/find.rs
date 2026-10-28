@@ -274,7 +274,7 @@ impl FindSession {
         match found {
             Some((m, _)) => self.select(m, ed),
             None => {
-                self.restore(ed);
+                ed.move_to(self.origin.0, false);
                 self.cur = None;
                 if !self.query.is_empty() {
                     out.status = Some("Not found".into());
@@ -692,5 +692,24 @@ Z"
         assert!(out.close && !out.edited);
         assert_eq!(out.status.as_deref(), Some("Not found"));
         assert_eq!((e.cursor, e.anchor), (pos(0, 1), None));
+    }
+
+    #[test]
+    fn find_not_found_clears_existing_selection() {
+        let mut e = ed("one two");
+        e.move_to(pos(0, 1), false);
+        e.move_to(pos(0, 3), true);
+        let mut f = FindSession::new(&e, false);
+        typ(&mut f, &mut e, "zz");
+        assert_eq!((e.cursor, e.anchor), (pos(0, 3), None));
+    }
+
+    #[test]
+    fn replace_ctrl_a_does_not_replace_all() {
+        let mut e = ed("ab ab");
+        let mut f = replace_session(&mut e, "ab", "Z");
+        let out = press(&mut f, &mut e, KeyCode::Char('a'), KeyModifiers::CONTROL);
+        assert!(!out.close && !out.edited);
+        assert_eq!(e.buf.rope.to_string(), "ab ab");
     }
 }
