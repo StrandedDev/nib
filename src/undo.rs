@@ -145,6 +145,7 @@ impl UndoStack {
 /// Replaces the chars of `old` at `at` with `new`.
 fn splice(buf: &mut Buffer, at: usize, old: &str, new: &str) {
     let n = old.chars().count();
+    buf.note_change(at);
     if n > 0 {
         buf.rope.remove(at..at + n);
     }

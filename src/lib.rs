@@ -9,6 +9,7 @@ pub mod edit;
 pub mod fileio;
 mod files;
 pub mod find;
+pub mod highlight;
 pub mod indent;
 pub mod keymap;
 pub mod layout;

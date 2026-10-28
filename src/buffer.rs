@@ -19,6 +19,9 @@ pub struct Buffer {
     pub dirty: bool,
     /// Bumped on every real text change; keys layout caches.
     pub version: u64,
+    /// Lowest line changed since `take_changed_from`; a new buffer counts
+    /// as changed from line 0.
+    changed_from: usize,
 }
 
 const BOM: &str = "\u{FEFF}";
@@ -54,6 +57,7 @@ impl Buffer {
             },
             dirty: false,
             version: 0,
+            changed_from: 0,
         }
     }
 
@@ -67,7 +71,19 @@ impl Buffer {
             },
             dirty: false,
             version: 0,
+            changed_from: 0,
         }
+    }
+
+    /// Records a change starting at char `at`, before the rope changes.
+    pub fn note_change(&mut self, at: usize) {
+        self.changed_from = self.changed_from.min(self.rope.char_to_line(at));
+    }
+
+    /// The lowest line changed since the last call (`usize::MAX` when
+    /// none), and resets it.
+    pub fn take_changed_from(&mut self) -> usize {
+        std::mem::replace(&mut self.changed_from, usize::MAX)
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {

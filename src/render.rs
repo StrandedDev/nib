@@ -18,6 +18,7 @@ use crate::cli;
 use crate::cursor::{Pos, from_char_idx, line_text};
 use crate::edit::Editor;
 use crate::find::FindSession;
+use crate::highlight::{self, Cache, Style};
 use crate::layout::{self, Row, Viewport};
 use crate::palette::Item;
 use crate::prompt::Prompt;
@@ -37,6 +38,39 @@ impl Command for MarkColour {
     #[cfg(windows)]
     fn execute_winapi(&self) -> io::Result<()> {
         Ok(())
+    }
+}
+
+/// Sets the foreground with a raw SGR code, so only the 16 ANSI colours
+/// are ever written (crossterm writes named colours as 256-colour indices).
+struct Fg(&'static str);
+
+impl Command for Fg {
+    fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
+        write!(f, "\x1b[{}m", self.0)
+    }
+
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The terminal's default foreground.
+const FG_DEFAULT: &str = "39";
+/// Bright black, for control marks.
+const FG_MARK: &str = "90";
+
+/// SGR foreground code for a highlight style.
+fn style_fg(style: Style) -> &'static str {
+    match style {
+        Style::Normal => FG_DEFAULT,
+        Style::Heading | Style::Literal => "35",
+        Style::Emph | Style::Number => "33",
+        Style::Code | Style::String => "32",
+        Style::Link | Style::Key => "34",
+        Style::ListMark => "36",
+        Style::Punct => FG_MARK,
     }
 }
 
@@ -62,6 +96,8 @@ pub struct AppView<'a> {
     /// The open find/replace session: its matches are underlined.
     pub find: Option<&'a FindSession>,
     pub palette: Option<PaletteView<'a>>,
+    /// Syntax highlighting, with fence state known up to the top line.
+    pub syntax: Option<&'a Cache>,
 }
 
 /// The open command palette, ready to draw.
@@ -89,10 +125,23 @@ pub fn draw(out: &mut impl Write, app: &AppView) -> io::Result<()> {
     let text_h = h.saturating_sub(2);
     let rope = &app.editor.buf.rope;
     let rows = layout::visible_rows(rope, app.viewport);
+    let mut syntax = app
+        .syntax
+        .and_then(|c| Some((c.lang()?, c.state_at(rows.first()?.line))));
+    // Styles of the line being drawn, worked out once for all its rows.
+    let mut styled = (usize::MAX, Vec::new());
     for y in 0..text_h {
         queue!(out, MoveTo(0, y + 1))?;
         let used = match rows.get(usize::from(y)) {
-            Some(row) => draw_gutter(out, row, app.gutter)? + draw_row(out, app, row)?,
+            Some(row) => {
+                if let Some((lang, state)) = &mut syntax {
+                    if styled.0 != row.line {
+                        let s = line_text(rope, row.line);
+                        styled = (row.line, highlight::line_styles(*lang, s, state));
+                    }
+                }
+                draw_gutter(out, row, app.gutter)? + draw_row(out, app, row, &styled.1)?
+            }
             None => 0,
         };
         if used < usize::from(w) {
@@ -253,10 +302,25 @@ fn set_attr(
 const REVERSE: (Attribute, Attribute) = (Attribute::Reverse, Attribute::NoReverse);
 const UNDERLINE: (Attribute, Attribute) = (Attribute::Underlined, Attribute::NoUnderline);
 
+/// Switches the foreground, writing only on a change.
+fn set_fg(out: &mut impl Write, state: &mut &'static str, want: &'static str) -> io::Result<()> {
+    if *state != want {
+        queue!(out, Fg(want))?;
+        *state = want;
+    }
+    Ok(())
+}
+
 /// Draws one text row from the cursor's current position. Returns the
 /// number of cells written. Selected cells, and the line end when its
-/// newline is selected, are drawn in reverse video.
-fn draw_row(out: &mut impl Write, app: &AppView, row: &Row) -> io::Result<usize> {
+/// newline is selected, are drawn in reverse video without syntax colour.
+/// `styles` are the line's highlight ranges in char columns, sorted.
+fn draw_row(
+    out: &mut impl Write,
+    app: &AppView,
+    row: &Row,
+    styles: &[(std::ops::Range<usize>, Style)],
+) -> io::Result<usize> {
     let rope = &app.editor.buf.rope;
     let s = line_text(rope, row.line);
     let sel = app
@@ -284,7 +348,14 @@ fn draw_row(out: &mut impl Write, app: &AppView, row: &Row) -> io::Result<usize>
         let k = marks.partition_point(|m| m.end <= i);
         marks.get(k).is_some_and(|m| m.start <= i)
     };
-    let (mut rev, mut under) = (false, false);
+    let style_at = |col: usize| {
+        let k = styles.partition_point(|(r, _)| r.end <= col);
+        match styles.get(k) {
+            Some((r, st)) if r.start <= col => *st,
+            _ => Style::Normal,
+        }
+    };
+    let (mut rev, mut under, mut fg) = (false, false, FG_DEFAULT);
     let mut x = 0;
     for c in cells {
         if c.x > x {
@@ -293,22 +364,25 @@ fn draw_row(out: &mut impl Write, app: &AppView, row: &Row) -> io::Result<usize>
             queue!(out, Print(" ".repeat(c.x - x)))?;
         }
         x = c.x + c.w;
-        set_attr(out, &mut rev, selected(c.start), REVERSE)?;
+        let sel = selected(c.start);
+        set_attr(out, &mut rev, sel, REVERSE)?;
         set_attr(out, &mut under, marked(c.start), UNDERLINE)?;
+        let colour = if sel {
+            FG_DEFAULT
+        } else {
+            style_fg(style_at(c.start))
+        };
         let g = s.slice(c.start..c.end);
         if g.char(0) == '\t' {
             queue!(out, Print(" ".repeat(c.w)))?;
         } else if g.chars().any(char::is_control) {
-            queue!(
-                out,
-                MarkColour,
-                Print(CONTROL_MARK),
-                SetForegroundColor(Color::Reset)
-            )?;
+            set_fg(out, &mut fg, FG_MARK)?;
+            queue!(out, Print(CONTROL_MARK))?;
             if c.w > 1 {
                 queue!(out, Print(" ".repeat(c.w - 1)))?;
             }
         } else if c.w > 0 {
+            set_fg(out, &mut fg, colour)?;
             queue!(out, Print(g))?;
         } else {
             // A lone zero-width grapheme would merge with its neighbour.
@@ -318,11 +392,13 @@ fn draw_row(out: &mut impl Write, app: &AppView, row: &Row) -> io::Result<usize>
     if row.end_col == len && x < usize::from(app.viewport.width) && selected(len) {
         set_attr(out, &mut rev, true, REVERSE)?;
         set_attr(out, &mut under, false, UNDERLINE)?;
+        set_fg(out, &mut fg, FG_DEFAULT)?;
         queue!(out, Print(' '))?;
         x += 1;
     }
     set_attr(out, &mut rev, false, REVERSE)?;
     set_attr(out, &mut under, false, UNDERLINE)?;
+    set_fg(out, &mut fg, FG_DEFAULT)?;
     Ok(x)
 }
 
@@ -488,6 +564,7 @@ mod tests {
             prompt: None,
             find: None,
             palette: None,
+            syntax: None,
         };
         let mut out = Vec::new();
         draw(&mut out, &view).unwrap();
@@ -542,6 +619,7 @@ mod tests {
             prompt: Some(f.prompt()),
             find: Some(&f),
             palette: None,
+            syntax: None,
         };
         let mut out = Vec::new();
         draw(&mut out, &view).unwrap();
@@ -567,6 +645,7 @@ mod tests {
             prompt: None,
             find: None,
             palette: None,
+            syntax: None,
         };
         let mut out = Vec::new();
         draw(&mut out, &view).unwrap();
@@ -607,6 +686,7 @@ mod tests {
             prompt: Some(f.prompt()),
             find: Some(&f),
             palette: None,
+            syntax: None,
         };
         let mut out = Vec::new();
         let t = std::time::Instant::now();
@@ -617,6 +697,57 @@ mod tests {
             out.contains("\u{1b}[4mab\u{1b}[24m"),
             "matches still underlined"
         );
+        assert!(took < std::time::Duration::from_millis(50), "{took:?}");
+    }
+
+    /// A frame of `e` as Markdown, the window starting at line `top`.
+    fn markdown_frame(e: &mut Editor, top: usize, wrap: bool) -> String {
+        use crate::highlight::{Cache, Lang};
+        let mut vp = Viewport::new(20, 3, wrap, 4);
+        vp.top.line = top;
+        let mut syntax = Cache::default();
+        syntax.sync(&mut e.buf, Some(Lang::Markdown), top);
+        let view = AppView {
+            editor: e,
+            viewport: &vp,
+            screen: (20, 5),
+            gutter: 0,
+            name: String::new(),
+            state: String::new(),
+            status: None,
+            prompt: None,
+            find: None,
+            palette: None,
+            syntax: Some(&syntax),
+        };
+        let mut out = Vec::new();
+        draw(&mut out, &view).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn markdown_drawn_in_ansi_colours() {
+        let text = "```\ncode\n```\n# Hi";
+        let mut e = Editor::new(crate::buffer::Buffer::from_str_detect(text));
+        // The fence opens above the window: "code" is still code (green).
+        let f = markdown_frame(&mut e, 1, true);
+        assert!(f.contains("\u{1b}[2;1H\u{1b}[32mcode\u{1b}[39m"), "{f:?}");
+        assert!(f.contains("\u{1b}[4;1H\u{1b}[35m# Hi\u{1b}[39m"), "{f:?}");
+        // Selected cells drop their colour so the selection reads as one block.
+        e.move_to(pos(3, 2), false);
+        e.move_to(pos(3, 4), true);
+        let f = markdown_frame(&mut e, 1, true);
+        assert!(f.contains("\u{1b}[35m# \u{1b}[7m\u{1b}[39mHi"), "{f:?}");
+    }
+
+    #[test]
+    fn markdown_huge_line_draws_fast() {
+        let line = "*a* `b` ".repeat(5 * 1024 * 1024 / 8);
+        let mut e = Editor::new(crate::buffer::Buffer::from_str_detect(&line));
+        let t = std::time::Instant::now();
+        let f = markdown_frame(&mut e, 0, true);
+        let took = t.elapsed();
+        assert!(f.contains("\u{1b}[33m*a*"), "{:?}", &f[..200]);
         assert!(took < std::time::Duration::from_millis(50), "{took:?}");
     }
 
@@ -644,6 +775,7 @@ mod tests {
                 selected,
                 items: pal.items(&Keymap::defaults()),
             }),
+            syntax: None,
         };
         let mut out = Vec::new();
         draw(&mut out, &view).unwrap();

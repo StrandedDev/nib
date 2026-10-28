@@ -17,6 +17,7 @@ use crate::edit::Editor;
 use crate::fileio;
 use crate::files::{FileFlow, Then, file_name};
 use crate::find::FindSession;
+use crate::highlight;
 use crate::indent::Indent;
 use crate::keymap::Keymap;
 use crate::layout::{self, Viewport};
@@ -31,6 +32,8 @@ pub struct App {
     pub(crate) editor: Editor,
     pub(crate) path: Option<PathBuf>,
     pub(crate) viewport: Viewport,
+    /// Highlighting state for lines above the window.
+    syntax: highlight::Cache,
     /// Terminal size (columns, rows).
     pub(crate) screen: (u16, u16),
     pub(crate) keymap: Keymap,
@@ -119,6 +122,9 @@ impl App {
             if let (true, Some(msg)) = (redraw, &self.message) {
                 screens::draw(&mut out, self.screen, msg)?;
             } else if redraw {
+                let lang = self.path.as_deref().and_then(highlight::lang_for);
+                let top = self.viewport.top.line;
+                self.syntax.sync(&mut self.editor.buf, lang, top);
                 render::draw(&mut out, &self.view())?;
                 // After the frame, so it cannot land in the middle of one.
                 if let Some(seq) = self.clip.take_pending() {
@@ -178,6 +184,7 @@ impl App {
                 selected: p.selected,
                 items: p.items(&self.keymap),
             }),
+            syntax: Some(&self.syntax),
         }
     }
 
@@ -547,6 +554,7 @@ impl App {
             editor: Editor::new(buf),
             path,
             viewport: Viewport::new(80, 22, true, TAB_WIDTH),
+            syntax: highlight::Cache::default(),
             screen: (80, 24),
             keymap: Keymap::defaults(),
             is_new: true,

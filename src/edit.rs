@@ -295,6 +295,7 @@ impl Editor {
         let at = range.start;
         let cursor_before = self.cursor;
         let removed = self.buf.rope.slice(range.clone()).to_string();
+        self.buf.note_change(at);
         if range.start < range.end {
             self.buf.rope.remove(range);
         }
