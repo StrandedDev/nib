@@ -1278,6 +1278,62 @@ three"
         );
     }
 
+    /// Names the open palette shows, in order.
+    fn palette_names(app: &App) -> Vec<&'static str> {
+        let p = app.palette.as_ref().expect("palette open");
+        p.items(&app.keymap).into_iter().map(|i| i.name).collect()
+    }
+
+    #[test]
+    fn palette_lists_every_command_but_itself() {
+        let mut app = doc("x");
+        app.dispatch(CommandId::Palette);
+        let names = palette_names(&app);
+        for want in [
+            "Move Down",
+            "Move Word Left",
+            "Move to Line End",
+            "Move to File Start",
+            "Page Down",
+            "Select Right",
+            "Select to Line End",
+            "Backspace",
+            "Delete",
+            "New Line",
+            "Indent",
+            "Save",
+        ] {
+            assert!(names.contains(&want), "{want} missing from {names:?}");
+        }
+        assert!(!names.contains(&"Command Palette"), "{names:?}");
+        assert_eq!(names.len(), 43);
+    }
+
+    #[test]
+    fn palette_runs_move_down() {
+        let mut app = doc("ab\ncd\nef");
+        app.editor.move_to(pos(0, 1), false);
+        palette_type(&mut app, "move down");
+        assert_eq!(palette_names(&app)[0], "Move Down");
+        app.handle_event(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.palette.is_none());
+        assert_eq!(app.editor.cursor, pos(1, 1));
+    }
+
+    #[test]
+    fn palette_runs_select_right_and_indent() {
+        let mut app = doc("abc");
+        palette_type(&mut app, "select right");
+        app.handle_event(key(KeyCode::Enter, KeyModifiers::NONE));
+        palette_type(&mut app, "select right");
+        app.handle_event(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.editor.selection(), Some(0..2));
+        app.editor.move_to(pos(0, 0), false);
+        palette_type(&mut app, "indent");
+        app.handle_event(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.editor.buf.rope.to_string(), "    abc");
+    }
+
     #[test]
     fn palette_esc_closes() {
         let mut app = doc("x");

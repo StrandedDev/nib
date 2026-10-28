@@ -51,7 +51,8 @@ pub enum CommandId {
 
 pub struct CommandInfo {
     pub id: CommandId,
-    /// Human label shown in the palette.
+    /// Human label shown in the palette, which lists every command but
+    /// `Palette` itself.
     pub name: &'static str,
     /// Snake_case key used by the config file.
     pub config_key: &'static str,
@@ -59,7 +60,6 @@ pub struct CommandInfo {
     pub default_keys: &'static [&'static str],
     /// Default chords that are bound but hidden from `keys_for` (e.g. F1 for the palette).
     pub hidden_keys: &'static [&'static str],
-    pub in_palette: bool,
 }
 
 pub static COMMANDS: &[CommandInfo] = &[
@@ -69,7 +69,6 @@ pub static COMMANDS: &[CommandInfo] = &[
         config_key: "palette",
         default_keys: &["ctrl+p"],
         hidden_keys: &["f1"],
-        in_palette: false,
     },
     CommandInfo {
         id: CommandId::Save,
@@ -77,7 +76,6 @@ pub static COMMANDS: &[CommandInfo] = &[
         config_key: "save",
         default_keys: &["ctrl+s"],
         hidden_keys: &[],
-        in_palette: true,
     },
     CommandInfo {
         id: CommandId::SaveAs,
@@ -85,7 +83,6 @@ pub static COMMANDS: &[CommandInfo] = &[
         config_key: "save_as",
         default_keys: &[],
         hidden_keys: &[],
-        in_palette: true,
     },
     CommandInfo {
         id: CommandId::Open,
@@ -93,7 +90,6 @@ pub static COMMANDS: &[CommandInfo] = &[
         config_key: "open",
         default_keys: &["ctrl+o"],
         hidden_keys: &[],
-        in_palette: true,
     },
     CommandInfo {
         id: CommandId::Quit,
@@ -101,7 +97,6 @@ pub static COMMANDS: &[CommandInfo] = &[
         config_key: "quit",
         default_keys: &["ctrl+q"],
         hidden_keys: &[],
-        in_palette: true,
     },
     CommandInfo {
         id: CommandId::Find,
@@ -109,7 +104,6 @@ pub static COMMANDS: &[CommandInfo] = &[
         config_key: "find",
         default_keys: &["ctrl+f"],
         hidden_keys: &[],
-        in_palette: true,
     },
     CommandInfo {
         id: CommandId::FindNext,
@@ -117,7 +111,6 @@ pub static COMMANDS: &[CommandInfo] = &[
         config_key: "find_next",
         default_keys: &[],
         hidden_keys: &[],
-        in_palette: true,
     },
     CommandInfo {
         id: CommandId::FindPrev,
@@ -125,7 +118,6 @@ pub static COMMANDS: &[CommandInfo] = &[
         config_key: "find_prev",
         default_keys: &[],
         hidden_keys: &[],
-        in_palette: true,
     },
     CommandInfo {
         id: CommandId::Replace,
@@ -133,7 +125,6 @@ pub static COMMANDS: &[CommandInfo] = &[
         config_key: "replace",
         default_keys: &["ctrl+r"],
         hidden_keys: &[],
-        in_palette: true,
     },
     CommandInfo {
         id: CommandId::GotoLine,
@@ -141,7 +132,6 @@ pub static COMMANDS: &[CommandInfo] = &[
         config_key: "goto_line",
         default_keys: &["ctrl+g"],
         hidden_keys: &[],
-        in_palette: true,
     },
     CommandInfo {
         id: CommandId::Undo,
@@ -149,7 +139,6 @@ pub static COMMANDS: &[CommandInfo] = &[
         config_key: "undo",
         default_keys: &["ctrl+z"],
         hidden_keys: &[],
-        in_palette: true,
     },
     CommandInfo {
         id: CommandId::Redo,
@@ -157,7 +146,6 @@ pub static COMMANDS: &[CommandInfo] = &[
         config_key: "redo",
         default_keys: &["ctrl+y", "ctrl+shift+z"],
         hidden_keys: &[],
-        in_palette: true,
     },
     CommandInfo {
         id: CommandId::Copy,
@@ -165,7 +153,6 @@ pub static COMMANDS: &[CommandInfo] = &[
         config_key: "copy",
         default_keys: &["ctrl+c"],
         hidden_keys: &[],
-        in_palette: true,
     },
     CommandInfo {
         id: CommandId::Cut,
@@ -173,7 +160,6 @@ pub static COMMANDS: &[CommandInfo] = &[
         config_key: "cut",
         default_keys: &["ctrl+x"],
         hidden_keys: &[],
-        in_palette: true,
     },
     CommandInfo {
         id: CommandId::Paste,
@@ -181,7 +167,6 @@ pub static COMMANDS: &[CommandInfo] = &[
         config_key: "paste",
         default_keys: &["ctrl+v"],
         hidden_keys: &[],
-        in_palette: true,
     },
     CommandInfo {
         id: CommandId::SelectAll,
@@ -189,7 +174,6 @@ pub static COMMANDS: &[CommandInfo] = &[
         config_key: "select_all",
         default_keys: &["ctrl+a"],
         hidden_keys: &[],
-        in_palette: true,
     },
     CommandInfo {
         id: CommandId::ToggleWrap,
@@ -197,7 +181,6 @@ pub static COMMANDS: &[CommandInfo] = &[
         config_key: "toggle_wrap",
         default_keys: &[],
         hidden_keys: &[],
-        in_palette: true,
     },
     CommandInfo {
         id: CommandId::ToggleLineNumbers,
@@ -205,7 +188,6 @@ pub static COMMANDS: &[CommandInfo] = &[
         config_key: "toggle_line_numbers",
         default_keys: &[],
         hidden_keys: &[],
-        in_palette: true,
     },
     CommandInfo {
         id: CommandId::Left,
@@ -213,7 +195,6 @@ pub static COMMANDS: &[CommandInfo] = &[
         config_key: "left",
         default_keys: &["left"],
         hidden_keys: &[],
-        in_palette: false,
     },
     CommandInfo {
         id: CommandId::Right,
@@ -221,7 +202,6 @@ pub static COMMANDS: &[CommandInfo] = &[
         config_key: "right",
         default_keys: &["right"],
         hidden_keys: &[],
-        in_palette: false,
     },
     CommandInfo {
         id: CommandId::Up,
@@ -229,7 +209,6 @@ pub static COMMANDS: &[CommandInfo] = &[
         config_key: "up",
         default_keys: &["up"],
         hidden_keys: &[],
-        in_palette: false,
     },
     CommandInfo {
         id: CommandId::Down,
@@ -237,39 +216,34 @@ pub static COMMANDS: &[CommandInfo] = &[
         config_key: "down",
         default_keys: &["down"],
         hidden_keys: &[],
-        in_palette: false,
     },
     CommandInfo {
         id: CommandId::WordLeft,
-        name: "Word Left",
+        name: "Move Word Left",
         config_key: "word_left",
         default_keys: &["ctrl+left"],
         hidden_keys: &[],
-        in_palette: false,
     },
     CommandInfo {
         id: CommandId::WordRight,
-        name: "Word Right",
+        name: "Move Word Right",
         config_key: "word_right",
         default_keys: &["ctrl+right"],
         hidden_keys: &[],
-        in_palette: false,
     },
     CommandInfo {
         id: CommandId::Home,
-        name: "Line Start",
+        name: "Move to Line Start",
         config_key: "home",
         default_keys: &["home"],
         hidden_keys: &[],
-        in_palette: false,
     },
     CommandInfo {
         id: CommandId::End,
-        name: "Line End",
+        name: "Move to Line End",
         config_key: "end",
         default_keys: &["end"],
         hidden_keys: &[],
-        in_palette: false,
     },
     CommandInfo {
         id: CommandId::PageUp,
@@ -277,7 +251,6 @@ pub static COMMANDS: &[CommandInfo] = &[
         config_key: "page_up",
         default_keys: &["pageup"],
         hidden_keys: &[],
-        in_palette: false,
     },
     CommandInfo {
         id: CommandId::PageDown,
@@ -285,23 +258,20 @@ pub static COMMANDS: &[CommandInfo] = &[
         config_key: "page_down",
         default_keys: &["pagedown"],
         hidden_keys: &[],
-        in_palette: false,
     },
     CommandInfo {
         id: CommandId::FileStart,
-        name: "File Start",
+        name: "Move to File Start",
         config_key: "file_start",
         default_keys: &["ctrl+home"],
         hidden_keys: &[],
-        in_palette: false,
     },
     CommandInfo {
         id: CommandId::FileEnd,
-        name: "File End",
+        name: "Move to File End",
         config_key: "file_end",
         default_keys: &["ctrl+end"],
         hidden_keys: &[],
-        in_palette: false,
     },
     CommandInfo {
         id: CommandId::SelLeft,
@@ -309,7 +279,6 @@ pub static COMMANDS: &[CommandInfo] = &[
         config_key: "sel_left",
         default_keys: &["shift+left"],
         hidden_keys: &[],
-        in_palette: false,
     },
     CommandInfo {
         id: CommandId::SelRight,
@@ -317,7 +286,6 @@ pub static COMMANDS: &[CommandInfo] = &[
         config_key: "sel_right",
         default_keys: &["shift+right"],
         hidden_keys: &[],
-        in_palette: false,
     },
     CommandInfo {
         id: CommandId::SelUp,
@@ -325,7 +293,6 @@ pub static COMMANDS: &[CommandInfo] = &[
         config_key: "sel_up",
         default_keys: &["shift+up"],
         hidden_keys: &[],
-        in_palette: false,
     },
     CommandInfo {
         id: CommandId::SelDown,
@@ -333,7 +300,6 @@ pub static COMMANDS: &[CommandInfo] = &[
         config_key: "sel_down",
         default_keys: &["shift+down"],
         hidden_keys: &[],
-        in_palette: false,
     },
     CommandInfo {
         id: CommandId::SelWordLeft,
@@ -341,7 +307,6 @@ pub static COMMANDS: &[CommandInfo] = &[
         config_key: "sel_word_left",
         default_keys: &["ctrl+shift+left"],
         hidden_keys: &[],
-        in_palette: false,
     },
     CommandInfo {
         id: CommandId::SelWordRight,
@@ -349,7 +314,6 @@ pub static COMMANDS: &[CommandInfo] = &[
         config_key: "sel_word_right",
         default_keys: &["ctrl+shift+right"],
         hidden_keys: &[],
-        in_palette: false,
     },
     CommandInfo {
         id: CommandId::SelHome,
@@ -357,7 +321,6 @@ pub static COMMANDS: &[CommandInfo] = &[
         config_key: "sel_home",
         default_keys: &["shift+home"],
         hidden_keys: &[],
-        in_palette: false,
     },
     CommandInfo {
         id: CommandId::SelEnd,
@@ -365,7 +328,6 @@ pub static COMMANDS: &[CommandInfo] = &[
         config_key: "sel_end",
         default_keys: &["shift+end"],
         hidden_keys: &[],
-        in_palette: false,
     },
     CommandInfo {
         id: CommandId::Backspace,
@@ -373,7 +335,6 @@ pub static COMMANDS: &[CommandInfo] = &[
         config_key: "backspace",
         default_keys: &["backspace"],
         hidden_keys: &[],
-        in_palette: false,
     },
     CommandInfo {
         id: CommandId::Delete,
@@ -381,7 +342,6 @@ pub static COMMANDS: &[CommandInfo] = &[
         config_key: "delete",
         default_keys: &["delete"],
         hidden_keys: &[],
-        in_palette: false,
     },
     CommandInfo {
         id: CommandId::DeleteWordBack,
@@ -389,7 +349,6 @@ pub static COMMANDS: &[CommandInfo] = &[
         config_key: "delete_word_back",
         default_keys: &["ctrl+backspace"],
         hidden_keys: &[],
-        in_palette: true,
     },
     CommandInfo {
         id: CommandId::DeleteWordFwd,
@@ -397,23 +356,20 @@ pub static COMMANDS: &[CommandInfo] = &[
         config_key: "delete_word_fwd",
         default_keys: &["ctrl+delete"],
         hidden_keys: &[],
-        in_palette: true,
     },
     CommandInfo {
         id: CommandId::Newline,
-        name: "Newline",
+        name: "New Line",
         config_key: "newline",
         default_keys: &["enter"],
         hidden_keys: &[],
-        in_palette: false,
     },
     CommandInfo {
         id: CommandId::Tab,
-        name: "Tab",
+        name: "Indent",
         config_key: "tab",
         default_keys: &["tab"],
         hidden_keys: &[],
-        in_palette: false,
     },
 ];
 

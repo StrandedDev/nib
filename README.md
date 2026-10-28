@@ -175,11 +175,18 @@ why Replace is Ctrl+R.
 
 ## Command palette
 
-Press **Ctrl+P** (or F1). The palette lists these commands with their current keys:
+Press **Ctrl+P** (or F1). The palette lists every command in the [key table](#keys) with its
+current keys, so anything you can do with a key you can also find by name:
 
 Save · Save As · Open File · Quit · Find · Find Next · Find Previous · Replace · Go to Line ·
 Undo · Redo · Copy · Cut · Paste · Select All · Toggle Wrap · Toggle Line Numbers ·
-Delete Word Back · Delete Word Forward
+Move Left / Right / Up / Down · Move Word Left / Right · Move to Line Start / End ·
+Page Up / Down · Move to File Start / End · Select Left / Right / Up / Down ·
+Select Word Left / Right · Select to Line Start / End · Backspace · Delete ·
+Delete Word Back · Delete Word Forward · New Line · Indent
+
+A command run from the palette does exactly what its key does: *Move Down* moves the cursor down
+a line, *Indent* inserts an indent, *Select Right* extends the selection.
 
 Type to filter (fuzzy and case-insensitive: `tln` finds *Toggle Line Numbers*). Up / Down or
 Ctrl+P / Ctrl+N move the selection, Enter runs the command, Esc closes the palette.

@@ -87,11 +87,12 @@ impl Palette {
         }
     }
 
-    /// Palette commands matching the query, best first, then by name.
+    /// Commands matching the query, best first, then by name. Every
+    /// command is listed except the palette itself.
     pub fn items(&self, keymap: &Keymap) -> Vec<Item> {
         let mut scored: Vec<(i32, Item)> = COMMANDS
             .iter()
-            .filter(|c| c.in_palette)
+            .filter(|c| c.id != CommandId::Palette)
             .filter_map(|c| {
                 let s = score(&self.query, c.name)?;
                 let keys = keymap.keys_for(c.id).into_iter().map(|k| format_chord(&k));
@@ -173,13 +174,11 @@ mod tests {
     }
 
     #[test]
-    fn empty_query_lists_all_palette_commands() {
+    fn empty_query_lists_all_commands_but_the_palette() {
         let km = Keymap::defaults();
         let items = pal("").items(&km);
-        assert_eq!(
-            items.len(),
-            COMMANDS.iter().filter(|c| c.in_palette).count()
-        );
+        // 44 commands, less the palette itself.
+        assert_eq!(items.len(), 43);
         assert!(items.windows(2).all(|w| w[0].name <= w[1].name));
     }
 
