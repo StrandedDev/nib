@@ -629,10 +629,7 @@ mod tests {
     #[test]
     fn open_dirty_asks() {
         let d = tempdir().unwrap();
-        let (p, mut app) = existing(
-            &d, "abc
-",
-        );
+        let (p, mut app) = existing(&d, "abc\n");
         typ(&mut app, "x");
         app.handle_event(ctrl('o'));
         assert_eq!(prompt_label(&app), "Save? (Y)es / (N)o / (C)ancel");
@@ -641,20 +638,12 @@ mod tests {
         app.handle_event(ctrl('o'));
         press(&mut app, 'n');
         assert_eq!(prompt_label(&app), "Open: ");
-        assert_eq!(
-            std::fs::read_to_string(&p).unwrap(),
-            "abc
-"
-        );
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "abc\n");
         app.handle_event(key(KeyCode::Esc, KeyModifiers::NONE));
         app.handle_event(ctrl('o'));
         press(&mut app, 'y');
         assert_eq!(prompt_label(&app), "Open: ");
-        assert_eq!(
-            std::fs::read_to_string(&p).unwrap(),
-            "xabc
-"
-        );
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "xabc\n");
         // A clean buffer goes straight to the name.
         app.handle_event(key(KeyCode::Esc, KeyModifiers::NONE));
         app.handle_event(ctrl('o'));
@@ -670,10 +659,7 @@ mod tests {
     #[test]
     fn open_existing_replaces_buffer_and_resets_undo() {
         let d = tempdir().unwrap();
-        let (_, mut app) = existing(
-            &d, "abc
-",
-        );
+        let (_, mut app) = existing(&d, "abc\n");
         typ(&mut app, "x");
         app.dispatch(CommandId::Save);
         app.editor.move_to(pos(0, 2), true);
@@ -681,8 +667,7 @@ mod tests {
         std::fs::write(
             &b,
             "	one
-	two
-",
+	two\n",
         )
         .unwrap();
         // Pretend the old buffer was scrolled.
@@ -715,10 +700,7 @@ mod tests {
     #[test]
     fn open_missing_makes_new_file_without_creating() {
         let d = tempdir().unwrap();
-        let (_, mut app) = existing(
-            &d, "abc
-",
-        );
+        let (_, mut app) = existing(&d, "abc\n");
         open_name(&mut app, &d.path().join("fresh"));
         let p = d.path().join("fresh.txt");
         assert_eq!(app.path.as_deref(), Some(p.as_path()));
@@ -727,25 +709,18 @@ mod tests {
         assert!(!p.exists() && !d.path().join("fresh").exists());
         typ(&mut app, "hi");
         app.dispatch(CommandId::Save);
-        assert_eq!(
-            std::fs::read_to_string(&p).unwrap(),
-            "hi
-"
-        );
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "hi\n");
     }
 
     #[test]
     fn open_binary_keeps_buffer_with_status() {
         let d = tempdir().unwrap();
-        let (a, mut app) = existing(
-            &d, "abc
-",
-        );
+        let (a, mut app) = existing(&d, "abc\n");
         typ(&mut app, "x");
         let sub = d.path().join("sub");
         std::fs::create_dir(&sub).unwrap();
         let bin = d.path().join("b.bin");
-        std::fs::write(&bin, b"a b").unwrap();
+        std::fs::write(&bin, b"a\0b").unwrap();
         let big = d.path().join("big.txt");
         std::fs::File::create(&big)
             .unwrap()
@@ -765,7 +740,7 @@ mod tests {
             assert_eq!(app.path.as_deref(), Some(a.as_path()));
             assert!(app.editor.buf.dirty);
         }
-        assert_eq!(std::fs::read(&bin).unwrap(), b"a b");
+        assert_eq!(std::fs::read(&bin).unwrap(), b"a\0b");
         // An empty name cancels without a word.
         app.status = None;
         app.handle_event(ctrl('o'));
@@ -803,11 +778,7 @@ mod tests {
         press(&mut app, 'y');
         submit_name(&mut app, &old);
         press(&mut app, 'y');
-        assert_eq!(
-            std::fs::read_to_string(&old).unwrap(),
-            "hi
-"
-        );
+        assert_eq!(std::fs::read_to_string(&old).unwrap(), "hi\n");
         match &app.prompt {
             Some((Prompt::Text { label, .. }, _)) => assert_eq!(label, "Open: "),
             _ => panic!("expected the open prompt"),
@@ -817,18 +788,9 @@ mod tests {
     #[test]
     fn open_with_line_suffix() {
         let d = tempdir().unwrap();
-        let (_, mut app) = existing(
-            &d, "abc
-",
-        );
+        let (_, mut app) = existing(&d, "abc\n");
         let b = d.path().join("b.md");
-        std::fs::write(
-            &b, "1
-2
-3
-",
-        )
-        .unwrap();
+        std::fs::write(&b, "1\n2\n3\n").unwrap();
         app.handle_event(ctrl('o'));
         typ(&mut app, &format!("{}:2", b.display()));
         app.handle_event(key(KeyCode::Enter, KeyModifiers::NONE));
@@ -848,10 +810,7 @@ mod tests {
     #[test]
     fn save_as_changes_path() {
         let d = tempdir().unwrap();
-        let (a, mut app) = existing(
-            &d, "abc
-",
-        );
+        let (a, mut app) = existing(&d, "abc\n");
         typ(&mut app, "x");
         app.dispatch(CommandId::SaveAs);
         match &app.prompt {
@@ -873,16 +832,8 @@ mod tests {
         save_as(&mut app, &d.path().join("b"));
         let b = d.path().join("b.txt");
         assert!(app.prompt.is_none());
-        assert_eq!(
-            std::fs::read_to_string(&b).unwrap(),
-            "xabc
-"
-        );
-        assert_eq!(
-            std::fs::read_to_string(&a).unwrap(),
-            "abc
-"
-        );
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "xabc\n");
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "abc\n");
         assert_eq!(app.path.as_deref(), Some(b.as_path()));
         assert_eq!(app.disk_mtime, fileio::mtime(&b));
         assert!(!app.editor.buf.dirty && !app.is_new && !app.read_only);
@@ -901,29 +852,19 @@ mod tests {
     #[test]
     fn save_as_same_path_no_confirm() {
         let d = tempdir().unwrap();
-        let (a, mut app) = existing(
-            &d, "abc
-",
-        );
+        let (a, mut app) = existing(&d, "abc\n");
         typ(&mut app, "x");
         app.dispatch(CommandId::SaveAs);
         app.handle_event(key(KeyCode::Enter, KeyModifiers::NONE));
         assert!(app.prompt.is_none());
-        assert_eq!(
-            std::fs::read_to_string(&a).unwrap(),
-            "xabc
-"
-        );
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "xabc\n");
         assert!(!app.editor.buf.dirty);
     }
 
     #[test]
     fn save_as_existing_asks_replace() {
         let d = tempdir().unwrap();
-        let (a, mut app) = existing(
-            &d, "abc
-",
-        );
+        let (a, mut app) = existing(&d, "abc\n");
         let b = d.path().join("b.txt");
         std::fs::write(&b, "old").unwrap();
         save_as(&mut app, &b);
@@ -934,11 +875,7 @@ mod tests {
         assert_eq!(app.path.as_deref(), Some(a.as_path()));
         save_as(&mut app, &b);
         press(&mut app, 'y');
-        assert_eq!(
-            std::fs::read_to_string(&b).unwrap(),
-            "abc
-"
-        );
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "abc\n");
         assert_eq!(app.path.as_deref(), Some(b.as_path()));
         // An empty final component is not a name.
         save_as(&mut app, &d.path().join("sub/"));
@@ -950,11 +887,7 @@ mod tests {
     fn save_as_from_read_only_to_new_path() {
         let d = tempdir().unwrap();
         let ro = d.path().join("ro.txt");
-        std::fs::write(
-            &ro, "abc
-",
-        )
-        .unwrap();
+        std::fs::write(&ro, "abc\n").unwrap();
         set_readonly(&ro, true);
         let mut app = App::open(Some(ro.clone()), None).unwrap();
         typ(&mut app, "x");
@@ -973,16 +906,8 @@ mod tests {
         save_as(&mut app, &b);
         let ro_text = std::fs::read_to_string(&ro).unwrap();
         set_readonly(&ro, false);
-        assert_eq!(
-            ro_text,
-            "abc
-"
-        );
-        assert_eq!(
-            std::fs::read_to_string(&b).unwrap(),
-            "xabc
-"
-        );
+        assert_eq!(ro_text, "abc\n");
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "xabc\n");
         assert_eq!(app.path.as_deref(), Some(b.as_path()));
         assert!(!app.read_only && !app.editor.buf.dirty);
         assert!(!title_state(&app).contains("[Read-only]"));
