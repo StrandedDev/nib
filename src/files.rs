@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use crate::app::{App, PromptPurpose};
 use crate::buffer::{Buffer, LineEnding};
 use crate::cli;
+use crate::config::Config;
 use crate::cursor::Pos;
 use crate::edit::Editor;
 use crate::fileio::{self, Loaded};
@@ -77,7 +78,23 @@ impl App {
         line: Option<usize>,
         recovery: Recovery,
     ) -> Result<App> {
-        let mut app = App::from_buffer(Buffer::new_empty(LineEnding::Lf), None);
+        App::open_configured(path, line, recovery, Config::default())
+    }
+
+    /// `open_with` using the settings and keymap in `config`.
+    pub fn open_configured(
+        path: Option<PathBuf>,
+        line: Option<usize>,
+        recovery: Recovery,
+        config: Config,
+    ) -> Result<App> {
+        let mut app = App::from_buffer(Buffer::new_empty(config.line_ending), None);
+        app.new_line_ending = config.line_ending;
+        app.keymap = config.keymap;
+        app.viewport.wrap = config.wrap;
+        app.line_numbers = config.line_numbers;
+        app.tab_width = config.tab_width;
+        app.set_indent(indent::detect_indent(&app.editor.buf.rope, ""));
         app.recovery = recovery;
         if let Some(path) = path {
             app.open_path(path, line, true, false)?;
@@ -95,7 +112,7 @@ impl App {
         startup: bool,
         allow_large: bool,
     ) -> Result<()> {
-        match read_for_edit(&path, allow_large)? {
+        match read_for_edit(&path, allow_large, self.new_line_ending)? {
             Opened::Edit(buf, is_new) => self.open_checked(buf, is_new, path, line, startup),
             Opened::Refused(why) if startup => self.message = Some(why),
             Opened::Refused(why) => self.set_status(&why),
@@ -401,7 +418,7 @@ impl App {
     /// Loads a file again after a prompt; it may have changed meanwhile.
     /// A large file only gets here after the size question was answered.
     fn reread(&mut self, path: &Path) -> Option<(Buffer, bool)> {
-        match read_for_edit(path, true) {
+        match read_for_edit(path, true, self.new_line_ending) {
             Ok(Opened::Edit(buf, is_new)) => Some((buf, is_new)),
             Ok(Opened::Refused(why)) => {
                 self.set_status(&why);
@@ -487,12 +504,12 @@ enum Opened {
     TooLarge(u64),
 }
 
-fn read_for_edit(path: &Path, allow_large: bool) -> Result<Opened> {
+fn read_for_edit(path: &Path, allow_large: bool, new_le: LineEnding) -> Result<Opened> {
     let name = file_name(path);
     let loaded = fileio::load(path, allow_large).with_context(|| format!("cannot open {name}"))?;
     Ok(match loaded {
         Loaded::Text(b) => Opened::Edit(b, false),
-        Loaded::NotFound => Opened::Edit(Buffer::new_empty(LineEnding::Lf), true),
+        Loaded::NotFound => Opened::Edit(Buffer::new_empty(new_le), true),
         Loaded::Binary => Opened::Refused(format!("{name} is not a UTF-8 text file")),
         Loaded::Directory => Opened::Refused(format!("{name} is a directory")),
         Loaded::NotRegular => Opened::Refused(format!("{name} is not a regular file")),
@@ -553,6 +570,40 @@ mod tests {
             title_state(&app),
             fileio::format_mtime(app.disk_mtime.unwrap())
         );
+    }
+
+    fn crlf_config() -> Config {
+        Config {
+            line_ending: LineEnding::CrLf,
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn crlf_new_files() {
+        let d = tempdir().unwrap();
+        let p = d.path().join("new.txt");
+        let mut app =
+            App::open_configured(Some(p.clone()), None, Recovery::disabled(), crlf_config())
+                .unwrap();
+        typ(&mut app, "a");
+        app.handle_event(key(KeyCode::Enter, KeyModifiers::NONE));
+        typ(&mut app, "b");
+        app.dispatch(CommandId::Save);
+        assert_eq!(std::fs::read(&p).unwrap(), b"a\r\nb\r\n");
+
+        // An existing file keeps its own line ending.
+        let old = d.path().join("old.txt");
+        std::fs::write(&old, "x\n").unwrap();
+        let mut app =
+            App::open_configured(Some(old.clone()), None, Recovery::disabled(), crlf_config())
+                .unwrap();
+        app.handle_event(key(KeyCode::Enter, KeyModifiers::NONE));
+        app.dispatch(CommandId::Save);
+        assert_eq!(std::fs::read(&old).unwrap(), b"\nx\n");
+
+        let app = App::open_configured(None, None, Recovery::disabled(), crlf_config()).unwrap();
+        assert_eq!(app.editor.buf.meta.line_ending, LineEnding::CrLf);
     }
 
     #[test]
@@ -857,6 +908,39 @@ mod tests {
         assert!(app.editor.buf.dirty);
         app.dispatch(CommandId::Redo);
         assert!(!app.editor.buf.dirty);
+    }
+
+    #[test]
+    fn config_tab_width_overrides_detection() {
+        let d = tempdir().unwrap();
+        let open = |name: &str, text: &str| {
+            let p = d.path().join(name);
+            std::fs::write(&p, text).unwrap();
+            let cfg = Config {
+                tab_width: Some(3),
+                ..Config::default()
+            };
+            App::open_configured(Some(p), None, Recovery::disabled(), cfg).unwrap()
+        };
+        let app = open("a.yml", "a:\n  b:\n    c\n");
+        assert_eq!(app.editor.indent, Indent::Spaces(3));
+        assert_eq!(app.viewport.tab_width, 3);
+        // A tab-indented file keeps real tabs, shown 3 columns wide.
+        let app = open("Makefile", "all:\n\tcc\n");
+        assert_eq!(app.editor.indent, Indent::Tabs);
+        assert_eq!(app.viewport.tab_width, 3);
+        let mut app = App::open_configured(
+            None,
+            None,
+            Recovery::disabled(),
+            Config {
+                tab_width: Some(3),
+                ..Config::default()
+            },
+        )
+        .unwrap();
+        app.handle_event(key(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.editor.buf.rope.to_string(), "   ");
     }
 
     #[test]

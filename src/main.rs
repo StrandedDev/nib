@@ -4,7 +4,7 @@ use std::process::ExitCode;
 use nib::{
     app::App,
     cli::{self, Args},
-    clipboard,
+    clipboard, config,
     recovery::Recovery,
     terminal,
 };
@@ -27,8 +27,12 @@ fn main() -> ExitCode {
     };
     terminal::install_panic_hook();
     // The guard lives inside `run`, so the terminal is restored before we print.
-    let result = App::open_with(path, line, Recovery::system()).and_then(|app| {
+    let (config, warning) = config::load();
+    let result = App::open_configured(path, line, Recovery::system(), config).and_then(|app| {
         let mut app = app.with_clipboard(clipboard::detect());
+        if let Some(warning) = warning {
+            app.set_status(&warning);
+        }
         app.run()?;
         Ok(app.exit_note().map(str::to_string))
     });

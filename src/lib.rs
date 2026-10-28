@@ -3,6 +3,7 @@ pub mod buffer;
 pub mod cli;
 pub mod clipboard;
 pub mod commands;
+pub mod config;
 pub mod cursor;
 pub mod edit;
 pub mod fileio;

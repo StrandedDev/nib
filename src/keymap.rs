@@ -154,6 +154,15 @@ impl Keymap {
         self.map.insert(chord, id);
     }
 
+    /// Makes `chords` the only chords for `id`, taking each from any command
+    /// that had it.
+    pub fn set_keys(&mut self, id: CommandId, chords: &[KeyChord]) {
+        self.map.retain(|_, cid| *cid != id);
+        for &chord in chords {
+            self.bind(chord, id);
+        }
+    }
+
     /// Visible chords bound to `id`: registry-declared defaults first, in order, then any
     /// others added with `bind` (sorted by display form). Hidden defaults are omitted.
     pub fn keys_for(&self, id: CommandId) -> Vec<KeyChord> {

@@ -9,7 +9,7 @@ use crossterm::event::{
 };
 use crossterm::terminal;
 
-use crate::buffer::Buffer;
+use crate::buffer::{Buffer, LineEnding};
 use crate::clipboard::{Clip, Osc52};
 use crate::commands::CommandId;
 use crate::cursor::{self, Pos};
@@ -49,6 +49,10 @@ pub struct App {
     pub(crate) clip: Box<dyn Clip>,
     pub(crate) quit: bool,
     pub(crate) line_numbers: bool,
+    /// Line ending given to buffers for files not on disk yet.
+    pub(crate) new_line_ending: LineEnding,
+    /// Indent width from the config; replaces the detected one.
+    pub(crate) tab_width: Option<u8>,
     pub(crate) recovery: Recovery,
     /// Why nib left before opening anything, for stderr.
     pub(crate) exit_note: Option<String>,
@@ -71,11 +75,16 @@ const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 const POLL: Duration = Duration::from_millis(250);
 
 impl App {
-    pub(crate) fn set_indent(&mut self, indent: Indent) {
+    /// Uses the `detected` indent, with the width from the config when set.
+    pub(crate) fn set_indent(&mut self, detected: Indent) {
+        let indent = match (detected, self.tab_width) {
+            (Indent::Spaces(_), Some(n)) => Indent::Spaces(n),
+            (other, _) => other,
+        };
         self.editor.indent = indent;
         self.viewport.tab_width = match indent {
             Indent::Spaces(n) => n,
-            Indent::Tabs => TAB_WIDTH,
+            Indent::Tabs => self.tab_width.unwrap_or(TAB_WIDTH),
         };
     }
 
@@ -346,7 +355,7 @@ impl App {
         e.preferred_col = Some(usize::from(x));
     }
 
-    pub(crate) fn set_status(&mut self, msg: &str) {
+    pub fn set_status(&mut self, msg: &str) {
         self.status = Some((msg.to_string(), Instant::now()));
     }
 
@@ -552,6 +561,8 @@ impl App {
             clip: Box::new(Osc52::default()),
             quit: false,
             line_numbers: false,
+            new_line_ending: LineEnding::Lf,
+            tab_width: None,
             recovery: Recovery::disabled(),
             exit_note: None,
             message: None,

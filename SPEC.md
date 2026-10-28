@@ -152,7 +152,37 @@ so Ctrl+S / Ctrl+Q reach nib.
 
 TOML at `~/.config/nib/config.toml` (Linux) or `%APPDATA%\nib\config.toml` (Windows).
 Holds keymap overrides and settings: wrap, line numbers, tab width, new-file line ending.
-Under `sudo`, root's config is used.
+Under `sudo`, root's config is used. Read once at startup. Every entry is optional; a missing
+file means all defaults. Schema (values shown are the defaults):
+
+```toml
+wrap = true            # soft wrap
+line_numbers = false
+tab_width = 4          # 1 to 8; unset by default. When set, replaces the detected indent
+                       # width; files that indent with real tabs keep tabs, shown this wide
+line_ending = "lf"     # "lf" | "crlf"; for new files only (existing files keep theirs)
+
+[keys]
+save = "ctrl+s"                  # one chord
+redo = ["ctrl+y", "ctrl+shift+z"]  # or a list
+```
+
+- `[keys]` names are each command's config key: `palette`, `save`, `save_as`, `open`, `quit`,
+  `find`, `find_next`, `find_prev`, `replace`, `goto_line`, `undo`, `redo`, `copy`, `cut`,
+  `paste`, `select_all`, `toggle_wrap`, `toggle_line_numbers`, `left`, `right`, `up`, `down`,
+  `word_left`, `word_right`, `home`, `end`, `page_up`, `page_down`, `file_start`, `file_end`,
+  `sel_left`, `sel_right`, `sel_up`, `sel_down`, `sel_word_left`, `sel_word_right`, `sel_home`,
+  `sel_end`, `backspace`, `delete`, `delete_word_back`, `delete_word_fwd`, `newline`, `tab`.
+- Chords are modifiers `ctrl`, `alt`, `shift` joined with `+` to one key (any case): a
+  character, `f1`–`f12`, `enter`, `esc`, `tab`, `backspace`, `delete`, `insert`, `home`, `end`,
+  `pageup`, `pagedown`, `up`, `down`, `left`, `right`, `space`. An uppercase letter means
+  Shift plus that letter.
+- An override replaces all of that command's default chords (hidden ones such as F1 included);
+  an empty list leaves it palette-only. Each chord it names is removed from whichever command
+  had it by default.
+- Any error — invalid TOML, an unknown setting, command or key name, a value of the wrong type
+  or out of range, or one chord set for two commands — ignores the whole file: nib starts with
+  all defaults and shows `Config error: <msg> — using defaults` in the status line.
 
 ## 8. Distribution
 
