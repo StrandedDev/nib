@@ -5,7 +5,7 @@ use nib::{
     app::App,
     cli::{self, Args},
     clipboard, config,
-    recovery::Recovery,
+    recovery::{self, Recovery},
     terminal,
 };
 
@@ -16,7 +16,14 @@ fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Ok(Args::Help) => {
-            println!("{}", cli::help_text());
+            let (config, _) = config::load();
+            let recovery = recovery::system_dir();
+            let help = cli::help_text(
+                &config.keymap,
+                config::path().as_deref(),
+                recovery.as_deref(),
+            );
+            println!("{help}");
             return ExitCode::SUCCESS;
         }
         Ok(Args::Edit { path, .. }) => target(path),

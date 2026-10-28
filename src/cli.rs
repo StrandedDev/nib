@@ -1,6 +1,9 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+use crate::commands::{COMMANDS, CommandId};
+use crate::keymap::{Keymap, format_chord};
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Args {
     Edit {
@@ -19,8 +22,8 @@ pub fn parse(argv: impl Iterator<Item = OsString>) -> Result<Args, String> {
     for arg in argv {
         let flag = if only_paths { None } else { arg.to_str() };
         match flag {
-            Some("--version") => return Ok(Args::Version),
-            Some("--help") => return Ok(Args::Help),
+            Some("--version" | "-V") => return Ok(Args::Version),
+            Some("--help" | "-h") => return Ok(Args::Help),
             Some("--") => only_paths = true,
             Some(f) if f.starts_with('-') && f != "-" => {
                 return Err(format!("unknown option: {f}"));
@@ -39,20 +42,103 @@ pub fn version_text() -> String {
     format!("nib {}", env!("CARGO_PKG_VERSION"))
 }
 
-pub fn help_text() -> &'static str {
-    concat!(
-        "Usage: nib [FILE[:LINE]]\n",
-        "\n",
-        "A small terminal text editor.\n",
-        "\n",
-        "Options:\n",
-        "  --help      Show this help\n",
-        "  --version   Show the version\n",
-        "  --          Treat the next argument as a file name\n",
-        "\n",
-        "A new file without an extension gets .txt appended.\n",
-        "It is created on first save."
-    )
+const HELP_USAGE: &str = "Usage: nib [OPTIONS] [FILE[:LINE]]
+
+Arguments:
+  FILE        File to edit; a new file is created on its first save
+  FILE:LINE   Open FILE with the cursor on LINE
+
+Options:
+  -h, --help      Show this help
+  -V, --version   Show the version
+      --          Treat the next argument as a file name, even if it starts with -
+
+Examples:
+  nib                Empty buffer; the first save asks for a name
+  nib notes          Edit notes.txt (a new name without an extension gets .txt)
+  nib todo.md        Edit todo.md
+  nib app.log:42     Open app.log at line 42
+  nib -- -draft.md   Edit a file whose name starts with -
+";
+
+/// Commands listed under `Keys:`; the palette lists the rest.
+const HELP_KEYS: [CommandId; 13] = [
+    CommandId::Palette,
+    CommandId::Save,
+    CommandId::Open,
+    CommandId::Quit,
+    CommandId::Find,
+    CommandId::Replace,
+    CommandId::GotoLine,
+    CommandId::Undo,
+    CommandId::Redo,
+    CommandId::Copy,
+    CommandId::Cut,
+    CommandId::Paste,
+    CommandId::SelectAll,
+];
+
+/// The `--help` text. Keys come from `keymap`, so they match the user's
+/// config; a path is `None` when the system has no such directory.
+pub fn help_text(keymap: &Keymap, config: Option<&Path>, recovery: Option<&Path>) -> String {
+    let mut out = format!(
+        "{} - {}
+
+{HELP_USAGE}
+Keys:
+",
+        version_text(),
+        env!("CARGO_PKG_DESCRIPTION")
+    );
+    let rows: Vec<(String, &str)> = HELP_KEYS
+        .iter()
+        .map(|&id| {
+            let name = COMMANDS.iter().find(|c| c.id == id).map_or("", |c| c.name);
+            let keys: Vec<String> = keymap.keys_for(id).iter().map(format_chord).collect();
+            let keys = match (keys.is_empty(), id) {
+                (false, _) => keys.join(", "),
+                (true, CommandId::Palette) => "(none)".to_string(),
+                (true, _) => "(palette)".to_string(),
+            };
+            (keys, name)
+        })
+        .collect();
+    let width = rows.iter().map(|(keys, _)| keys.len()).max().unwrap_or(0);
+    for (keys, name) in &rows {
+        out.push_str(&format!(
+            "  {keys:<width$}   {name}
+"
+        ));
+    }
+    out.push_str(
+        "  Every other command, with its keys, is in the command palette.
+",
+    );
+    out.push_str(
+        "
+Files:
+",
+    );
+    for (label, path) in [("Config", config), ("Recovery", recovery)] {
+        let shown = path.map_or("not available on this system".to_string(), |p| {
+            p.display().to_string()
+        });
+        out.push_str(&format!(
+            "  {label:<10}{shown}
+"
+        ));
+    }
+    out.push_str(
+        "  The config sets wrap, line_numbers, tab_width, line_ending and [keys].
+",
+    );
+    out.push_str(concat!(
+        "
+Docs: ",
+        env!("CARGO_PKG_REPOSITORY"),
+        "#readme"
+    ));
+    out
 }
 
 pub fn resolve(raw: &str, exists: impl Fn(&Path) -> bool) -> (PathBuf, Option<usize>) {
@@ -179,9 +265,21 @@ mod tests {
     #[test]
     fn version_and_help_flags() {
         assert_eq!(parse_strs(&["--version"]), Ok(Args::Version));
+        assert_eq!(parse_strs(&["-V"]), Ok(Args::Version));
         assert_eq!(parse_strs(&["--help"]), Ok(Args::Help));
+        assert_eq!(parse_strs(&["-h"]), Ok(Args::Help));
         assert_eq!(version_text(), "nib 0.1.0");
-        assert!(help_text().lines().count() < 15);
+    }
+
+    #[test]
+    fn short_flags_after_double_dash_are_paths() {
+        assert_eq!(
+            parse_strs(&["--", "-h"]),
+            Ok(Args::Edit {
+                path: Some(PathBuf::from("-h")),
+                line: None
+            })
+        );
     }
 
     #[test]
@@ -223,17 +321,72 @@ mod tests {
         );
     }
 
+    fn default_help() -> String {
+        help_text(
+            &Keymap::defaults(),
+            Some(Path::new("cfg/nib/config.toml")),
+            Some(Path::new("data/nib/recovery")),
+        )
+    }
+
     #[test]
-    fn help_text_has_no_stray_indent() {
-        let mut indents = std::collections::HashSet::new();
-        for line in help_text().lines() {
-            assert_eq!(line, line.trim_end(), "trailing whitespace: {line:?}");
-            if line.starts_with(' ') {
-                assert!(line.contains("--"), "indented non-option row: {line:?}");
-                indents.insert(line.len() - line.trim_start().len());
-            }
+    fn help_covers_usage_options_examples_keys_files() {
+        let help = default_help();
+        assert!(help.starts_with("nib 0.1.0 - "));
+        for needle in [
+            "Usage: nib [OPTIONS] [FILE[:LINE]]",
+            "-h, --help",
+            "-V, --version",
+            "nib app.log:42",
+            "Ctrl+P",
+            "Command Palette",
+            "Ctrl+Y, Ctrl+Shift+Z",
+            "cfg/nib/config.toml",
+            "data/nib/recovery",
+            "https://github.com/StrandedDev/nib#readme",
+        ] {
+            assert!(
+                help.contains(needle),
+                "missing {needle:?} in:
+{help}"
+            );
         }
-        assert_eq!(indents.len(), 1, "option rows differ in indent");
-        assert!(help_text().starts_with("Usage:"));
+    }
+
+    #[test]
+    fn help_keys_follow_keymap() {
+        let mut km = Keymap::defaults();
+        km.set_keys(
+            CommandId::Save,
+            &[crate::keymap::parse_chord("f2").unwrap()],
+        );
+        km.set_keys(CommandId::Find, &[]);
+        let help = help_text(&km, None, None);
+        let line = |name: &str| {
+            help.lines()
+                .find(|l| l.trim_end().ends_with(name))
+                .unwrap_or_else(|| panic!("no {name} row"))
+                .to_string()
+        };
+        assert!(line(" Save").trim_start().starts_with("F2 "));
+        assert!(line(" Find").trim_start().starts_with("(palette) "));
+        assert!(help.contains("not available on this system"));
+    }
+
+    #[test]
+    fn help_rows_aligned_without_trailing_space() {
+        let help = default_help();
+        for line in help.lines() {
+            assert_eq!(line, line.trim_end(), "trailing whitespace: {line:?}");
+        }
+        let key_rows: Vec<&str> = help
+            .lines()
+            .skip_while(|l| *l != "Keys:")
+            .skip(1)
+            .take(HELP_KEYS.len())
+            .collect();
+        let name_col = |l: &str| l.rfind("   ").unwrap();
+        let col = name_col(key_rows[0]);
+        assert!(key_rows.iter().all(|l| name_col(l) == col), "{key_rows:#?}");
     }
 }

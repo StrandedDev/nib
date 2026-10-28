@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::ErrorKind;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
@@ -33,11 +33,16 @@ impl Default for Config {
     }
 }
 
-/// Reads `<config dir>/nib/config.toml`: `~/.config` on Linux, `%APPDATA%`
-/// on Windows.
+/// `<config dir>/nib/config.toml`: `~/.config` on Linux, `%APPDATA%` on
+/// Windows. `None` when the system has no config directory.
+pub fn path() -> Option<PathBuf> {
+    dirs::config_dir().map(|dir| dir.join("nib").join("config.toml"))
+}
+
+/// Reads the config at `path()`.
 pub fn load() -> (Config, Option<String>) {
-    match dirs::config_dir() {
-        Some(dir) => load_from(&dir.join("nib").join("config.toml")),
+    match path() {
+        Some(path) => load_from(&path),
         None => (Config::default(), None),
     }
 }

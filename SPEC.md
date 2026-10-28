@@ -70,7 +70,8 @@ regex search · multiple buffers/tabs · block selection · multiple cursors · 
 | `nib name.md` / `nib .rc` / `nib Makefile` (new) | Name kept as typed (has extension, starts with a dot, or is a known extensionless name). |
 | `nib path` (existing) | Opens exactly that file; never renamed. |
 | `nib path:42` | Opens at line 42. Only a trailing `:<digits>` counts, and only when no file with the full name exists (keeps `C:\x.md` safe). |
-| `nib --version`, `nib --help` | Print and exit. |
+| `nib --version` / `-V` | Print `nib X.Y.Z` and exit. |
+| `nib --help` / `-h` | Print help and exit: usage, arguments, options, examples, the main keys as currently bound (from the user's config), and the config and recovery paths for this system. |
 
 - The `.txt` rule applies only to new files: no extension **and** not starting with `.` **and** not one of `Makefile`, `Dockerfile`, `LICENSE`, `README` (matched case-insensitively). Only the final path component is checked, so `notes.d/todo` becomes `notes.d/todo.txt`. Same rule for the first-save name prompt.
 - New files are created on **first save**, never on launch.
@@ -238,6 +239,6 @@ redo = ["ctrl+y", "ctrl+shift+z"]  # or a list
 
 ## 9. README contents
 
-Pitch + screenshot · supported systems (Debian, Ubuntu, Fedora x86_64; Windows 10/11 x64) ·
-install / update / uninstall per method · SmartScreen note · usage · key table · palette ·
+Pitch + screenshots · feature highlights · quick start · supported systems (Debian, Ubuntu, Fedora x86_64; Windows 10/11 x64) ·
+install / update / uninstall per method · SmartScreen note · build from source · usage · key table · palette ·
 config reference · license. No limitations section. No AI/tool credits.

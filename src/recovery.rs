@@ -149,6 +149,12 @@ pub enum Check {
     Stale(SystemTime),
 }
 
+/// `<local data dir>/nib/recovery`: `~/.local/share` on Linux,
+/// `%LOCALAPPDATA%` on Windows.
+pub fn system_dir() -> Option<PathBuf> {
+    dirs::data_local_dir().map(|d| d.join("nib").join("recovery"))
+}
+
 /// Recovery and lock state of one nib. Without a directory every call does
 /// nothing, which is what tests that do not ask for recovery get.
 pub struct Recovery {
@@ -181,8 +187,8 @@ impl Recovery {
     /// The real directory: `%LOCALAPPDATA%\nib\recovery` on Windows,
     /// `~/.local/share/nib/recovery` on Linux. Only startup uses it.
     pub fn system() -> Recovery {
-        match dirs::data_local_dir() {
-            Some(d) => Recovery::new(d.join("nib").join("recovery"), pid_alive),
+        match system_dir() {
+            Some(d) => Recovery::new(d, pid_alive),
             None => Recovery::disabled(),
         }
     }
