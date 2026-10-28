@@ -10,6 +10,7 @@ use crate::buffer::LineEnding;
 use crate::commands::COMMANDS;
 use crate::keymap::{KeyChord, Keymap, format_chord, parse_chord};
 
+#[derive(Debug, PartialEq)]
 pub struct Config {
     pub wrap: bool,
     pub line_numbers: bool,
@@ -183,13 +184,13 @@ mod tests {
     #[test]
     fn bad_toml_defaults_with_warning() {
         let (cfg, warning) = load_text("wrap = false\nline_numbers = \n");
-        assert_eq!(
-            warning.as_deref(),
-            Some(
-                "Config error: line 2: string values must be quoted, expected literal string \u{2014} using defaults"
-            )
-        );
+        // The middle is toml's own wording, which can change between versions.
+        let warning = warning.expect("a warning");
+        assert!(warning.starts_with("Config error: line 2: "), "{warning:?}");
+        assert!(warning.ends_with(" \u{2014} using defaults"), "{warning:?}");
+        assert!(!warning.contains('\n'), "{warning:?}");
         assert!(cfg.wrap);
+        assert_eq!(cfg, Config::default());
     }
 
     fn ctrl(c: char) -> KeyEvent {

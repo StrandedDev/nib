@@ -126,6 +126,7 @@ pub fn format_chord(chord: &KeyChord) -> String {
     out
 }
 
+#[derive(Debug, PartialEq)]
 pub struct Keymap {
     map: HashMap<KeyChord, CommandId>,
 }
