@@ -37,7 +37,7 @@ pub fn detect_indent(rope: &Rope, file_name: &str) -> Indent {
                 }
                 prev = Some(n);
             }
-            _ => prev = None,
+            _ => prev = Some(0),
         }
     }
     if tabs > spaces {
@@ -132,6 +132,24 @@ mod tests {
     fn detect_two_space() {
         let src = "a:\n  b:\n    c: 1\n  d: 2\n";
         assert_eq!(detect(src, "x.yaml"), Indent::Spaces(2));
+    }
+
+    #[test]
+    fn detect_depth_one_two_space() {
+        assert_eq!(detect("a:\n  b\nc:\n  d", "x.yaml"), Indent::Spaces(2));
+    }
+
+    #[test]
+    fn detect_depth_one_four_space_python_like() {
+        let src = "def f():\n    x\n\ndef g():\n    y";
+        assert_eq!(detect(src, "x.py"), Indent::Spaces(4));
+        // Distinguishes from the fallback: 3 would otherwise be 4.
+        assert_eq!(detect("a\n   b\nc\n   d", "x.txt"), Indent::Spaces(3));
+    }
+
+    #[test]
+    fn blank_line_does_not_reset() {
+        assert_eq!(detect("a:\n\n  b", "x.yaml"), Indent::Spaces(2));
     }
 
     #[test]
