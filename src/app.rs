@@ -16,6 +16,7 @@ use crate::commands::CommandId;
 use crate::cursor::{self, Pos};
 use crate::edit::Editor;
 use crate::fileio::{self, Loaded};
+use crate::indent::{self, Indent};
 use crate::keymap::Keymap;
 use crate::layout::{self, Viewport};
 use crate::prompt::{Prompt, PromptResult};
@@ -72,6 +73,7 @@ impl App {
             Loaded::TooLarge(_) => bail!("{name} is larger than 50 MB"),
         };
         let mut app = App::from_buffer(buf, None);
+        app.set_indent(indent::detect_indent(&app.editor.buf.rope, &name));
         app.is_new = is_new;
         app.disk_mtime = fileio::mtime(&path);
         app.read_only = !is_new && !fileio::is_writable(&path);
@@ -82,6 +84,14 @@ impl App {
             app.editor.move_to(Pos { line, col: 0 }, false);
         }
         Ok(app)
+    }
+
+    fn set_indent(&mut self, indent: Indent) {
+        self.editor.indent = indent;
+        self.viewport.tab_width = match indent {
+            Indent::Spaces(n) => n,
+            Indent::Tabs => TAB_WIDTH,
+        };
     }
 
     pub fn with_clipboard(mut self, clip: Box<dyn Clip>) -> App {
@@ -180,7 +190,7 @@ impl App {
             C::DeleteWordBack => self.editor.delete_word_back(),
             C::DeleteWordFwd => self.editor.delete_word_fwd(),
             C::Newline => self.editor.newline(),
-            C::Tab => self.editor.insert_str(&" ".repeat(usize::from(TAB_WIDTH))),
+            C::Tab => self.editor.tab(),
             C::Undo | C::Redo => {
                 if id == C::Undo {
                     self.editor.undo();
@@ -397,7 +407,7 @@ impl App {
             }
             Event::Paste(s) => match &mut self.prompt {
                 Some((p, _)) => p.paste(&s),
-                None => self.editor.insert_str(&s),
+                None => self.editor.insert_str(&normalise_paste(&s)),
             },
             Event::Mouse(m) => {
                 self.handle_mouse_at(m, Instant::now());
@@ -475,6 +485,11 @@ impl App {
             quit: false,
         }
     }
+}
+
+/// Bracketed paste can send `\r` for newlines; pasted text only.
+fn normalise_paste(s: &str) -> String {
+    s.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 /// Last path component for display, or the whole path when it has none.
@@ -1288,5 +1303,50 @@ three"
         typ(&mut app, "x");
         app.dispatch(CommandId::Undo);
         assert_eq!(app.editor.cursor, pos(0, 0));
+    }
+
+    #[test]
+    fn paste_skips_autoindent() {
+        let mut app = App::open(None, None).unwrap();
+        typ(&mut app, "  - a");
+        app.handle_event(Event::Paste("x\ny".into()));
+        assert_eq!(app.editor.buf.rope.to_string(), "  - ax\ny");
+    }
+
+    #[test]
+    fn bracketed_paste_cr_becomes_newline() {
+        let mut app = App::open(None, None).unwrap();
+        app.handle_event(Event::Paste("a\rb\r\nc".into()));
+        assert_eq!(app.editor.buf.rope.to_string(), "a\nb\nc");
+        app.dispatch(CommandId::Undo);
+        assert_eq!(app.editor.buf.rope.to_string(), "");
+    }
+
+    #[test]
+    fn new_unnamed_buffer_indent_is_four() {
+        let mut app = App::open(None, None).unwrap();
+        assert_eq!(app.editor.indent, Indent::Spaces(4));
+        app.handle_event(key(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.editor.buf.rope.to_string(), "    ");
+    }
+
+    #[test]
+    fn open_detects_indent_and_sets_tab_width() {
+        let d = tempdir().unwrap();
+        let (_, app) = existing(&d, "a:\n  b:\n    c\n");
+        assert_eq!(app.editor.indent, Indent::Spaces(2));
+        assert_eq!(app.viewport.tab_width, 2);
+        let (_, app) = existing(&d, "a\n\tb\n\tc\n");
+        assert_eq!(app.editor.indent, Indent::Tabs);
+        assert_eq!(app.viewport.tab_width, 4);
+    }
+
+    #[test]
+    fn enter_and_tab_keys_use_smart_rules() {
+        let mut app = App::open(None, None).unwrap();
+        app.handle_event(key(KeyCode::Tab, KeyModifiers::NONE));
+        typ(&mut app, "- a");
+        app.handle_event(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.editor.buf.rope.to_string(), "    - a\n    - ");
     }
 }

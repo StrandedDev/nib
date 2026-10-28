@@ -5,6 +5,8 @@ use std::time::Instant;
 
 use crate::buffer::Buffer;
 use crate::cursor::{self, Pos};
+use crate::indent::{self, Enter, Indent};
+use crate::layout;
 use crate::undo::{Edit, EditKind, UndoStack};
 
 pub struct Editor {
@@ -12,6 +14,8 @@ pub struct Editor {
     pub cursor: Pos,
     pub anchor: Option<Pos>,
     pub preferred_col: Option<usize>,
+    /// What Tab inserts; detected when the file loads.
+    pub indent: Indent,
     undo: UndoStack,
     now: Option<Instant>,
 }
@@ -23,6 +27,7 @@ impl Editor {
             cursor: Pos::default(),
             anchor: None,
             preferred_col: None,
+            indent: Indent::Spaces(4),
             undo: UndoStack::new(),
             now: None,
         }
@@ -168,8 +173,43 @@ impl Editor {
         self.delete_range(self.cursor, end, EditKind::Deleting);
     }
 
+    /// Tab: with no selection, pads to the next stop of the indent width (or
+    /// a real tab); with one, replaces it with a single indent unit.
+    pub fn tab(&mut self) {
+        let unit = match self.indent {
+            Indent::Tabs => "\t".to_string(),
+            Indent::Spaces(n) => {
+                let n = usize::from(n.max(1));
+                let width = if self.selection().is_some() {
+                    0
+                } else {
+                    layout::display_col(&self.buf.rope, self.cursor, n as u8)
+                };
+                " ".repeat(n - width % n)
+            }
+        };
+        self.type_text(&unit);
+    }
+
+    /// Enter: one undo step. Indent and list rules use the line where the
+    /// selection (or cursor) starts.
     pub fn newline(&mut self) {
-        self.insert_str("\n");
+        let rope = &self.buf.rope;
+        let range = self.selection().unwrap_or_else(|| {
+            let at = cursor::to_char_idx(rope, self.cursor);
+            at..at
+        });
+        let line = rope.char_to_line(range.start);
+        let start = rope.line_to_char(line);
+        let text = rope.line(line).to_string();
+        let text = text.strip_suffix('\n').unwrap_or(&text);
+        match indent::plan_enter(text, range.start - start, self.selection().is_some()) {
+            Enter::Insert(s) => self.replace_range(range, &s, EditKind::Other),
+            Enter::ClearLine => {
+                let end = start + text.chars().count();
+                self.replace_range(start..end, "", EditKind::Other);
+            }
+        }
     }
 
     pub fn delete_word_back(&mut self) {
@@ -631,5 +671,119 @@ ef"
         e.preferred_col = Some(4);
         e.undo();
         assert_eq!((e.anchor, e.preferred_col), (None, None));
+    }
+
+    #[test]
+    fn enter_copies_indent() {
+        let mut e = ed("  \tab");
+        e.move_to(pos(0, 5), false);
+        e.newline();
+        assert_eq!(text(&e), "  \tab\n  \t");
+        assert_eq!(e.cursor, pos(1, 3));
+    }
+
+    #[test]
+    fn enter_inside_indent_does_not_duplicate() {
+        let mut e = ed("    x");
+        e.move_to(pos(0, 2), false);
+        e.newline();
+        assert_eq!(text(&e), "  \n    x");
+        assert_eq!(e.cursor, pos(1, 2));
+    }
+
+    #[test]
+    fn enter_continues_dash() {
+        let mut e = ed("  - item");
+        e.move_to(pos(0, 8), false);
+        e.newline();
+        assert_eq!(text(&e), "  - item\n  - ");
+        assert_eq!(e.cursor, pos(1, 4));
+    }
+
+    fn enter_at_end(src: &str) -> Editor {
+        let mut e = ed(src);
+        e.move_to(cursor::file_end(&e.buf.rope), false);
+        e.newline();
+        e
+    }
+
+    #[test]
+    fn enter_increments_number() {
+        let e = enter_at_end("9. x");
+        assert_eq!(text(&e), "9. x\n10. ");
+        assert_eq!(e.cursor, pos(1, 4));
+        assert_eq!(text(&enter_at_end("  007. x")), "  007. x\n  8. ");
+    }
+
+    #[test]
+    fn enter_resets_checkbox() {
+        let e = enter_at_end("- [x] done");
+        assert_eq!(text(&e), "- [x] done\n- [ ] ");
+        assert_eq!(e.cursor, pos(1, 6));
+    }
+
+    #[test]
+    fn enter_on_star_and_x_checkbox() {
+        assert_eq!(text(&enter_at_end("* [ ] a")), "* [ ] a\n* [ ] ");
+        assert_eq!(text(&enter_at_end("* [X] a")), "* [X] a\n* [ ] ");
+        assert_eq!(text(&enter_at_end("* a")), "* a\n* ");
+    }
+
+    #[test]
+    fn enter_on_empty_item_ends_list() {
+        let e = enter_at_end("- a\n  - [ ] ");
+        assert_eq!(text(&e), "- a\n");
+        assert_eq!(e.cursor, pos(1, 0));
+        assert_eq!(text(&enter_at_end("1. a\n2.   ")), "1. a\n");
+    }
+
+    #[test]
+    fn enter_empty_item_is_one_undo() {
+        let mut e = enter_at_end("- a\n- ");
+        assert_eq!(text(&e), "- a\n");
+        e.undo();
+        assert_eq!(text(&e), "- a\n- ");
+        assert_eq!(e.cursor, pos(1, 2));
+    }
+
+    #[test]
+    fn enter_inside_marker_is_plain() {
+        let mut e = ed("  - x");
+        e.move_to(pos(0, 3), false);
+        e.newline();
+        assert_eq!(text(&e), "  -\n   x");
+        assert_eq!(e.cursor, pos(1, 2));
+    }
+
+    #[test]
+    fn tab_aligns_to_next_stop_after_cjk() {
+        let mut e = ed("\u{4e2d}");
+        e.move_to(pos(0, 1), false);
+        e.tab();
+        assert_eq!(text(&e), "\u{4e2d}  ");
+        e.indent = Indent::Spaces(2);
+        e.tab();
+        assert_eq!(text(&e), "\u{4e2d}    ");
+    }
+
+    #[test]
+    fn tab_after_tab_char_and_tabs_mode() {
+        let mut e = ed("\tx");
+        e.move_to(pos(0, 2), false);
+        e.tab();
+        assert_eq!(text(&e), "\tx   ");
+        e.indent = Indent::Tabs;
+        e.tab();
+        assert_eq!(text(&e), "\tx   \t");
+    }
+
+    #[test]
+    fn tab_with_selection_replaces_it() {
+        let mut e = ed("abcdef");
+        e.move_to(pos(0, 1), false);
+        e.move_to(pos(0, 4), true);
+        e.tab();
+        assert_eq!(text(&e), "a    ef");
+        assert_eq!(e.cursor, pos(0, 5));
     }
 }

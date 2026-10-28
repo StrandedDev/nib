@@ -6,6 +6,7 @@ pub mod commands;
 pub mod cursor;
 pub mod edit;
 pub mod fileio;
+pub mod indent;
 pub mod keymap;
 pub mod layout;
 pub mod prompt;

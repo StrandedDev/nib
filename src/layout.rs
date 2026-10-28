@@ -396,6 +396,12 @@ fn boundary_at_or_after(s: RopeSlice, target: usize, tab: u8) -> (usize, usize) 
     (col, x)
 }
 
+/// Display column of `cur` within its line, with tabs at `tab_width` stops.
+pub fn display_col(rope: &Rope, cur: Pos, tab_width: u8) -> usize {
+    let line = cur.line.min(rope.len_lines() - 1);
+    x_at(rope.line(line), 0, cur.col, tab_width)
+}
+
 /// Display x of char column `col`, counted from the start of the row that
 /// begins at `row_start`.
 fn x_at(s: RopeSlice, row_start: usize, col: usize, tab: u8) -> usize {

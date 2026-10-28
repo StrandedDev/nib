@@ -80,10 +80,10 @@ so Ctrl+S / Ctrl+Q reach nib.
 - **Find:** incremental (highlights as you type), smart case (insensitive unless the query has a capital), plain text.
 - **Replace:** per match — this one / all / skip.
 - **Undo/redo:** in memory per session; typing grouped by word/pause.
-- **Paste:** bracketed paste; a paste is one undo step and bypasses auto-indent and list continuation.
-- **Auto-indent:** new line copies the previous line's indentation.
-- **List continuation:** Enter on `- x`, `* x`, `1. x`, `- [ ] x` starts the next item (numbers increment, checkboxes reset to `[ ]`); Enter on an empty item ends the list.
-- **Tab:** inserts spaces. Width detected from the file, else 4 (2 for `.json`). Files indented with tabs, and any `Makefile`, keep real tabs.
+- **Paste:** bracketed paste; a paste is one undo step and bypasses auto-indent and list continuation. In a bracketed paste, `\r\n` and lone `\r` both become newlines (some terminals send `\r`).
+- **Auto-indent:** Enter copies the current line's leading whitespace, up to the cursor column (Enter inside the indentation does not duplicate it). With a selection, Enter replaces it and uses the line where the selection starts. Enter is one undo step.
+- **List continuation:** Enter on `- x`, `* x`, `1. x`, `- [ ] x` starts the next item (numbers increment, checkboxes reset to `[ ]`); Markers are recognised after the indent; `* [ ] x` counts too, and a checkbox `[x]`/`[X]` resets to `[ ]`. Numbers drop leading zeros (`09.` becomes `10.`). Continuation applies only when the cursor is at or after the end of the marker; Enter inside the marker is a plain Enter. Enter on an empty item (only indent and marker) clears the line and leaves the cursor at column 0 without adding a line (one undo step).
+- **Tab:** inserts spaces up to the next multiple of the indent width, measured in display columns (so tabs and wide characters count correctly). Width is detected once at load from the first 10,000 lines (most common step between consecutive indented lines, 2 to 8), else 4 (2 for `.json`). Files with more tab-indented than space-indented lines, any `Makefile` (any case) and `*.mk` files use a real tab. With a selection, Tab replaces it with one indent unit.
 - **Syntax highlighting:** small hand-written highlighters for Markdown and JSON only.
 - **Command palette:** lists every action with its current key; fuzzy search; driven by the same command registry as the keymap.
 - **Clipboard:** system clipboard when a display exists (`DISPLAY`/`WAYLAND_DISPLAY` set, or Windows); otherwise OSC 52 (SSH, headless, TTY). Copy with no selection does nothing and says `Nothing selected`. OSC 52 payloads over 100 KB of base64 are not sent (status `Copied (too large for terminal clipboard)`); the copy stays inside nib.
