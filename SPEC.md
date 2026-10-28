@@ -39,7 +39,9 @@ regex search · multiple buffers/tabs · block selection · multiple cursors · 
 - **Status line:** empty by default; prompts appear here.
 - **Messages:** every message nib shows (errors and confirmations alike; "says" and "status" in
   this spec mean this) appears in a small box floating at the bottom right of the text area, on
-  the three rows just above the status line, its right edge one column in from the screen's.
+  the three rows just above the status line, its right edge one column in from the screen's. The
+  column on each side of the box is blanked on those rows, so a wide character cut by the box
+  never leaves half of itself on screen.
   Box-drawing border in bright black, text in the default colour, one space of padding each side.
   It fades 4 s after it appeared; a new message replaces the old one and restarts the 4 s; keys
   do not dismiss it early. A message wider than the screen allows (a 1-column margin each side,

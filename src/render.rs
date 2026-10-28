@@ -474,15 +474,20 @@ impl MessageBox {
         (self.x0..self.x0 + self.width()).contains(&x) && (self.y0..self.y0 + 3).contains(&y)
     }
 
+    /// Each row starts and ends with a blank in the margin columns, so a
+    /// wide glyph cut by a border never leaves half of itself on screen.
     fn draw(&self, out: &mut impl Write) -> io::Result<()> {
         let line = "\u{2500}".repeat(self.text.width() + 2);
         queue!(
             out,
-            MoveTo(self.x0, self.y0),
+            MoveTo(self.x0 - 1, self.y0),
+            Print(' '),
             Fg(FG_MARK),
             Print(format!("\u{250c}{line}\u{2510}")),
             ResetFg,
-            MoveTo(self.x0, self.y0 + 1),
+            Print(' '),
+            MoveTo(self.x0 - 1, self.y0 + 1),
+            Print(' '),
             Fg(FG_MARK),
             Print('\u{2502}'),
             ResetFg,
@@ -490,10 +495,13 @@ impl MessageBox {
             Fg(FG_MARK),
             Print('\u{2502}'),
             ResetFg,
-            MoveTo(self.x0, self.y0 + 2),
+            Print(' '),
+            MoveTo(self.x0 - 1, self.y0 + 2),
+            Print(' '),
             Fg(FG_MARK),
             Print(format!("\u{2514}{line}\u{2518}")),
             ResetFg,
+            Print(' '),
         )
     }
 }
@@ -932,14 +940,29 @@ mod tests {
     }
 
     #[test]
+    fn message_box_blanks_a_column_each_side() {
+        // Every line is 20 wide glyphs, so the glyph at columns 21-22
+        // (1-based) is cut by the box's left border at column 22.
+        let text = "\u{4f60}".repeat(20) + "\n";
+        let f = message_frame(&text.repeat(8), pos(0, 0), "Saved notes.md", (40, 10));
+        // Box rows start one column early with a blank and end with one.
+        for row in 7..=9 {
+            assert!(f.contains(&format!("\u{1b}[{row};21H \u{1b}[90m")), "{f:?}");
+        }
+        assert!(f.contains("\u{2510}\u{1b}[39m "), "{f:?}");
+        assert!(f.contains("\u{2502}\u{1b}[39m "), "{f:?}");
+        assert!(f.contains("\u{2518}\u{1b}[39m "), "{f:?}");
+    }
+
+    #[test]
     fn message_box_drawn_bottom_right_above_status_line() {
         let f = message_frame("abc", pos(0, 0), "Saved notes.md", (40, 10));
         // 18 wide, its right edge one column in from the screen edge, on the
         // three rows above the status line (screen rows 7 to 9, 1-based).
         let bar = "\u{1b}[90m\u{2502}\u{1b}[39m";
-        let top = "\u{1b}[7;22H\u{1b}[90m\u{250c}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2510}\u{1b}[39m";
-        let mid = format!("\u{1b}[8;22H{bar} Saved notes.md {bar}");
-        let bottom = "\u{1b}[9;22H\u{1b}[90m\u{2514}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2518}\u{1b}[39m";
+        let top = "\u{1b}[7;21H \u{1b}[90m\u{250c}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2510}\u{1b}[39m";
+        let mid = format!("\u{1b}[8;21H {bar} Saved notes.md {bar}");
+        let bottom = "\u{1b}[9;21H \u{1b}[90m\u{2514}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2518}\u{1b}[39m";
         assert!(f.contains(top), "{f:?}");
         assert!(f.contains(&mid), "{f:?}");
         assert!(f.contains(bottom), "{f:?}");
@@ -954,7 +977,7 @@ mod tests {
         let f = message_frame("abc", pos(0, 0), "abcdefghijklmnopqrstuvwxyz", (20, 10));
         // At most 18 wide on a 20-column screen: 14 cells of text.
         assert!(
-            f.contains("\u{1b}[8;2H\u{1b}[90m\u{2502}\u{1b}[39m abcdefghijklm\u{2026} "),
+            f.contains("\u{1b}[8;1H \u{1b}[90m\u{2502}\u{1b}[39m abcdefghijklm\u{2026} "),
             "{f:?}"
         );
         assert!(!f.contains("nopq"), "{f:?}");
@@ -975,7 +998,7 @@ mod tests {
         // 11, rows 3 to 5, one text row left above it.
         let f = message_frame("abc", pos(0, 0), "Saved", (12, 6));
         assert!(
-            f.contains("\u{1b}[4;3H\u{1b}[90m\u{2502}\u{1b}[39m Saved "),
+            f.contains("\u{1b}[4;2H \u{1b}[90m\u{2502}\u{1b}[39m Saved "),
             "{f:?}"
         );
     }

@@ -837,7 +837,7 @@ mod tests {
         let f = frame(&app);
         // 16 wide, ending one column in from the right edge.
         assert!(
-            f.contains("\u{1b}[8;24H\u{1b}[90m\u{2502}\u{1b}[39m Selected all "),
+            f.contains("\u{1b}[8;23H \u{1b}[90m\u{2502}\u{1b}[39m Selected all "),
             "{f:?}"
         );
         // A key press does not dismiss it.
@@ -861,7 +861,7 @@ mod tests {
         app.dispatch(CommandId::FindNext);
         let f = frame(&app);
         assert!(
-            f.contains("\u{1b}[8;27H\u{1b}[90m\u{2502}\u{1b}[39m Not found "),
+            f.contains("\u{1b}[8;26H \u{1b}[90m\u{2502}\u{1b}[39m Not found "),
             "{f:?}"
         );
         let t0 = app.status.as_ref().unwrap().1;
