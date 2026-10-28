@@ -239,6 +239,10 @@ redo = ["ctrl+y", "ctrl+shift+z"]  # or a list
 
 ## 9. README contents
 
-Pitch + screenshots · feature highlights · quick start · supported systems (Debian, Ubuntu, Fedora x86_64; Windows 10/11 x64) ·
-install / update / uninstall per method · SmartScreen note · build from source · usage · key table · palette ·
-config reference · license. No limitations section. No AI/tool credits.
+Kept short. Pitch + screenshots · features (Markdown and JSON highlighting named) · supported
+systems (Debian, Ubuntu, Fedora x86_64; Windows 10/11 x64) · install / update / uninstall per
+method · SmartScreen note · build from source (and where the binary lands) · brief usage and main
+keys · brief config with every `[keys]` name · links to `docs/INTERNALS.md`, this spec and the
+changelog · license. No limitations section. No AI/tool credits.
+
+`docs/INTERNALS.md` explains the code: architecture, each module, and how to add a command.
