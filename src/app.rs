@@ -49,6 +49,8 @@ pub struct App {
     pub(crate) quit: bool,
     pub(crate) line_numbers: bool,
     pub(crate) recovery: Recovery,
+    /// Why nib left before opening anything, for stderr.
+    pub(crate) exit_note: Option<String>,
 }
 
 /// What the open prompt is for.
@@ -133,6 +135,12 @@ impl App {
         let changed = msg.is_some();
         self.status_from(msg);
         changed
+    }
+
+    /// Printed by `main` once the terminal is back, so a nib that exits at
+    /// startup says why.
+    pub fn exit_note(&self) -> Option<&str> {
+        self.exit_note.as_deref()
     }
 
     fn view(&self) -> AppView<'_> {
@@ -531,6 +539,7 @@ impl App {
             quit: false,
             line_numbers: false,
             recovery: Recovery::disabled(),
+            exit_note: None,
         }
     }
 }

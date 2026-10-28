@@ -1,7 +1,7 @@
 //! Crash recovery files and the one-nib-per-file lock.
 
-use std::fs;
-use std::io;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -51,13 +51,17 @@ pub fn write(file: &Path, pid: u32, path: Option<&Path>, payload: &[u8]) -> io::
     if let Some(dir) = file.parent() {
         fs::create_dir_all(dir)?;
     }
+    let mut bytes = header(pid, path);
+    bytes.extend_from_slice(payload);
+    fileio::atomic_write(file, &bytes)
+}
+
+fn header(pid: u32, path: Option<&Path>) -> Vec<u8> {
     // A newline in a file name would break the line-based header.
     let shown = path.map_or(String::new(), |p| {
         p.to_string_lossy().replace(['\n', '\r'], "?")
     });
-    let mut bytes = format!("{MAGIC}\npid {pid}\npath {shown}\n\n").into_bytes();
-    bytes.extend_from_slice(payload);
-    fileio::atomic_write(file, &bytes)
+    format!("{MAGIC}\npid {pid}\npath {shown}\n\n").into_bytes()
 }
 
 /// The header and payload of `file`, or `None` when it is missing or not a
@@ -81,6 +85,24 @@ pub fn read(file: &Path) -> Option<(Header, Vec<u8>)> {
     let pid = std::str::from_utf8(pid).ok()?.parse().ok()?;
     let path = String::from_utf8_lossy(path).into_owned();
     Some((Header { pid, path }, rest.to_vec()))
+}
+
+/// `untitled-<pid>.rec`, or `untitled-<pid>-<n>.rec` when a crashed nib
+/// that had the same pid left one behind.
+fn free_untitled(dir: &Path, pid: u32) -> PathBuf {
+    let first = rec_path(dir, None, pid);
+    std::iter::once(first.clone())
+        .chain((1..1000).map(|n| dir.join(format!("untitled-{pid}-{n}.rec"))))
+        .find(|p| !p.exists())
+        // All taken: `flush` then refuses to write over the first.
+        .unwrap_or(first)
+}
+
+/// Deletes a recovery or lock file only while its header names `pid`.
+fn remove_if_ours(file: &Path, pid: u32) {
+    if read(file).is_some_and(|(h, _)| h.pid == pid) {
+        let _ = fs::remove_file(file);
+    }
 }
 
 /// A recovery file nib can parse, with UTF-8 text.
@@ -235,10 +257,20 @@ impl Recovery {
     /// nothing to write.
     pub fn flush(&mut self, buf: &Buffer, path: Option<&Path>) -> Option<io::Result<()>> {
         let dir = self.dir.as_ref().filter(|_| buf.dirty && !self.shared)?;
-        let file = rec_path(dir, path, self.pid);
-        if self.written.as_ref() != Some(&file) && file.exists() && !readable(&file) {
-            let msg = format!("{} is not a nib recovery file", file.display());
-            return Some(Err(io::Error::other(msg)));
+        let file = match (path, &self.written) {
+            (None, Some(w)) => w.clone(),
+            (None, None) => free_untitled(dir, self.pid),
+            (Some(_), _) => rec_path(dir, path, self.pid),
+        };
+        // Only ever write over our own file: anything else may be the only
+        // copy of someone's work.
+        if self.written.as_ref() != Some(&file) && file.exists() {
+            let why = if readable(&file) {
+                "holds older unsaved changes"
+            } else {
+                "is not a nib recovery file"
+            };
+            return Some(Err(io::Error::other(format!("{} {why}", file.display()))));
         }
         let r = write(&file, self.pid, path, &buf.to_bytes());
         if r.is_ok() {
@@ -250,49 +282,91 @@ impl Recovery {
 
     /// The buffer now belongs to `path`: what was kept for the old one goes,
     /// and the lock moves to `path` unless the buffer is a `shared` copy.
-    pub fn attach(&mut self, path: &Path, shared: bool) {
+    /// Returns whether it is shared, which it also becomes when another
+    /// running nib took the lock first.
+    pub fn attach(&mut self, path: &Path, shared: bool) -> bool {
         self.close();
-        self.shared = shared;
-        if let (Some(dir), false) = (&self.dir, shared) {
-            let lock = lock_path(dir, path);
-            // Best effort: without it a second nib only misses the warning.
-            if write(&lock, self.pid, Some(path), b"").is_ok() {
-                self.lock = Some(lock);
+        self.shared = shared || self.take_lock(path).is_some();
+        self.shared
+    }
+
+    /// Creates the lock file for `path`, never over a running nib's. Returns
+    /// that nib's pid when it holds the lock. Failing to lock is otherwise
+    /// ignored: a second nib then only misses the warning.
+    fn take_lock(&mut self, path: &Path) -> Option<u32> {
+        let dir = self.dir.clone()?;
+        let lock = lock_path(&dir, path);
+        fs::create_dir_all(&dir).ok()?;
+        // Twice: once more after clearing a lock no one holds.
+        for _ in 0..2 {
+            match OpenOptions::new().write(true).create_new(true).open(&lock) {
+                Ok(mut f) => {
+                    // A lock holds no user data, so a plain write will do.
+                    let r = f.write_all(&header(self.pid, Some(path)));
+                    if r.and_then(|()| f.sync_all()).is_ok() {
+                        self.lock = Some(lock);
+                    } else {
+                        drop(f);
+                        let _ = fs::remove_file(&lock);
+                    }
+                    return None;
+                }
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => match read(&lock) {
+                    Some((h, _)) if h.pid != self.pid && (self.alive)(h.pid) => {
+                        return Some(h.pid);
+                    }
+                    // Ours, a dead nib's, or unreadable: no one holds it.
+                    _ => {
+                        let _ = fs::remove_file(&lock);
+                    }
+                },
+                Err(_) => return None,
             }
         }
+        None
     }
 
     /// Clean exit or leaving the buffer: no recovery file, no lock.
     pub fn close(&mut self) {
         self.discard();
         if let Some(l) = self.lock.take() {
-            let _ = fs::remove_file(l);
+            remove_if_ours(&l, self.pid);
         }
     }
 
     /// Takes over the recovery file for `path` after its text was
-    /// recovered: it stays until the next successful save.
+    /// recovered: it is rewritten under this pid and stays until the next
+    /// successful save. If that fails it is left as it is.
     pub fn adopt(&mut self, path: &Path) {
-        if let Some(dir) = &self.dir {
-            self.written = Some(rec_path(dir, Some(path), self.pid));
+        let Some(dir) = &self.dir else {
+            return;
+        };
+        let file = rec_path(dir, Some(path), self.pid);
+        let Some((_, payload)) = read(&file) else {
+            return;
+        };
+        if write(&file, self.pid, Some(path), &payload).is_ok() {
+            self.written = Some(file);
         }
     }
 
     /// After a successful save to `path`: the file on disk is the safe copy
     /// now. Save As moves the lock to the new file, which is ours even when
     /// the old one was a read-only copy.
-    pub fn saved(&mut self, path: &Path) {
+    /// Returns whether the buffer is a shared copy after all.
+    pub fn saved(&mut self, path: &Path) -> bool {
         self.discard();
         let lock = self.dir.as_ref().map(|d| lock_path(d, path));
         if self.shared || self.lock != lock {
-            self.attach(path, false);
+            return self.attach(path, false);
         }
+        false
     }
 
     /// Removes the recovery file this nib wrote, if any.
     fn discard(&mut self) {
         if let Some(f) = self.written.take() {
-            let _ = fs::remove_file(f);
+            remove_if_ours(&f, self.pid);
         }
         self.written_version = None;
     }
@@ -510,16 +584,25 @@ mod tests {
         let rec_bytes = std::fs::read(&file).unwrap();
         let bak = file.with_extension("rec.bak");
         std::fs::write(&bak, "older").unwrap();
-        // Enter and Esc cancel: nothing is touched and nib leaves.
-        for ev in [
-            key(KeyCode::Enter, KeyModifiers::NONE),
-            key(KeyCode::Esc, KeyModifiers::NONE),
-        ] {
-            let mut app = open(&d, &p, dead);
-            app.handle_event(ev);
-            assert!(app.quit && app.path.is_none());
-            assert_eq!(std::fs::read(&file).unwrap(), rec_bytes);
-        }
+        // Esc cancels: nothing is touched and nib leaves.
+        let mut app = open(&d, &p, dead);
+        app.handle_event(key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.quit && app.path.is_none());
+        assert_eq!(std::fs::read(&file).unwrap(), rec_bytes);
+        // Enter means yes: safe, since the disk file is untouched.
+        let mut app = open(&d, &p, dead);
+        app.handle_event(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!app.quit && app.editor.buf.dirty);
+        assert_eq!(app.editor.buf.rope.to_string(), "work");
+        drop(app);
+        // Adopting rewrote the header under our pid; the text is the same.
+        let rec_bytes = std::fs::read(&file).unwrap();
+        assert!(rec_bytes.ends_with(
+            b"
+
+work
+"
+        ));
         let mut app = open(&d, &p, dead);
         press(&mut app, 'n');
         assert_eq!(app.path.as_deref(), Some(p.as_path()));
@@ -741,6 +824,158 @@ mod tests {
         press(&mut app, 'n');
         assert_eq!(std::fs::read(&a_lock).unwrap(), theirs);
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+    }
+
+    fn save_as_to(app: &mut App, p: &Path) {
+        app.dispatch(CommandId::SaveAs);
+        while matches!(&app.prompt, Some((Prompt::Text { input, .. }, _)) if !input.is_empty()) {
+            app.handle_event(key(KeyCode::Backspace, KeyModifiers::NONE));
+        }
+        submit_name(app, p);
+    }
+
+    #[test]
+    fn save_as_onto_stale_rec_never_touches_it() {
+        let d = tempdir().unwrap();
+        let dir = d.path().join("rec");
+        let (_, _, mut app) = clean(&d);
+        let b = d.path().join("b.txt");
+        let b_rec = rec_path(&dir, Some(&b), 1);
+        write(&b_rec, 999, Some(&b), b"crashed work\n").unwrap();
+        let before = std::fs::read(&b_rec).unwrap();
+        save_as_to(&mut app, &b);
+        assert_eq!(app.path.as_deref(), Some(b.as_path()));
+        let t = Instant::now();
+        typ(&mut app, "x");
+        assert!(app.tick(t));
+        assert_eq!(
+            status(&app),
+            format!(
+                "Recovery file not written: {} holds older unsaved changes",
+                b_rec.display()
+            )
+        );
+        app.on_fatal_error();
+        app.dispatch(CommandId::Save);
+        typ(&mut app, "y");
+        app.tick(secs(t, 3));
+        app.dispatch(CommandId::Quit);
+        press(&mut app, 'n');
+        assert_eq!(std::fs::read(&b_rec).unwrap(), before);
+    }
+
+    #[test]
+    fn save_as_onto_file_owned_by_live_nib_refused() {
+        let d = tempdir().unwrap();
+        let dir = d.path().join("rec");
+        let a = d.path().join("a.txt");
+        std::fs::write(&a, "abc\n").unwrap();
+        let mut app = open(&d, &a, alive);
+        typ(&mut app, "x");
+        let b = d.path().join("b.txt");
+        std::fs::write(&b, "theirs\n").unwrap();
+        let b_lock = lock_path(&dir, &b);
+        write(&b_lock, 4242, Some(&b), b"").unwrap();
+        let theirs = std::fs::read(&b_lock).unwrap();
+        save_as_to(&mut app, &b);
+        assert!(app.prompt.is_none(), "no replace question either");
+        assert_eq!(status(&app), "b.txt is open in another nib (pid 4242)");
+        assert_eq!(app.path.as_deref(), Some(a.as_path()));
+        assert!(app.editor.buf.dirty);
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "theirs\n");
+        assert_eq!(std::fs::read(&b_lock).unwrap(), theirs);
+    }
+
+    #[test]
+    fn discard_does_not_delete_foreign_rec() {
+        let d = tempdir().unwrap();
+        let (p, file, mut app) = clean(&d);
+        typ(&mut app, "x");
+        app.tick(Instant::now());
+        // Another nib took the file over since.
+        write(&file, 4242, Some(&p), b"theirs\n").unwrap();
+        let theirs = std::fs::read(&file).unwrap();
+        app.dispatch(CommandId::Save);
+        assert_eq!(std::fs::read(&file).unwrap(), theirs);
+    }
+
+    #[test]
+    fn close_does_not_delete_foreign_lock() {
+        let d = tempdir().unwrap();
+        let (p, _, mut app) = clean(&d);
+        let lock = lock_path(&d.path().join("rec"), &p);
+        assert!(lock.exists());
+        write(&lock, 4242, Some(&p), b"").unwrap();
+        let theirs = std::fs::read(&lock).unwrap();
+        app.dispatch(CommandId::Quit);
+        assert!(app.quit);
+        assert_eq!(std::fs::read(&lock).unwrap(), theirs);
+    }
+
+    #[test]
+    fn lock_create_new_detects_race() {
+        let d = tempdir().unwrap();
+        let dir = d.path().join("rec");
+        let p = d.path().join("a.txt");
+        let lock = lock_path(&dir, &p);
+        // Another nib locked the file after our check: we end up shared.
+        write(&lock, 4242, Some(&p), b"").unwrap();
+        let theirs = std::fs::read(&lock).unwrap();
+        let mut rec = Recovery::new(dir.clone(), alive);
+        assert!(rec.attach(&p, false));
+        assert_eq!(std::fs::read(&lock).unwrap(), theirs);
+        rec.close();
+        assert_eq!(std::fs::read(&lock).unwrap(), theirs);
+        // A dead owner's lock, or one nib cannot read, is replaced.
+        for stale in [&theirs[..], b"junk"] {
+            std::fs::write(&lock, stale).unwrap();
+            let mut rec = Recovery::new(dir.clone(), dead);
+            assert!(!rec.attach(&p, false));
+            assert_eq!(read(&lock).unwrap().0.pid, std::process::id());
+        }
+    }
+
+    #[test]
+    fn startup_cancel_keeps_reason_for_stderr() {
+        let d = tempdir().unwrap();
+        let (p, file) = crashed(&d, "disk\n", 999, b"work\n");
+        // A non-empty directory where the .bak goes: the rename fails.
+        let bak = file.with_extension("rec.bak");
+        std::fs::create_dir(&bak).unwrap();
+        std::fs::write(bak.join("x"), "").unwrap();
+        let mut app = open(&d, &p, dead);
+        press(&mut app, 'n');
+        assert!(app.quit);
+        let note = app.exit_note().unwrap_or_default();
+        assert!(note.starts_with("Recovery file not moved: "), "{note}");
+        assert!(file.exists());
+        // A plain no at startup has nothing to explain.
+        let a = locked(&d, "disk\n");
+        let mut app = open(&d, &a, alive);
+        press(&mut app, 'n');
+        assert!(app.quit && app.exit_note().is_none());
+    }
+
+    #[test]
+    fn untitled_pid_reuse_picks_free_name() {
+        let d = tempdir().unwrap();
+        let dir = d.path().join("rec");
+        // Left by a crashed nib that had the same pid.
+        let old = dir.join("untitled-77.rec");
+        write(&old, 77, None, b"crashed work\n").unwrap();
+        let before = std::fs::read(&old).unwrap();
+        let mut rec = Recovery::new(dir.clone(), dead);
+        rec.pid = 77;
+        let mut app = App::open_with(None, None, rec).unwrap();
+        typ(&mut app, "hi");
+        app.tick(Instant::now());
+        assert!(app.status.is_none(), "{}", status(&app));
+        let ours = dir.join("untitled-77-1.rec");
+        assert_eq!(read(&ours).unwrap().1, b"hi\n");
+        app.dispatch(CommandId::Save);
+        submit_name(&mut app, &d.path().join("n.txt"));
+        assert!(!ours.exists());
+        assert_eq!(std::fs::read(&old).unwrap(), before);
     }
 
     #[test]

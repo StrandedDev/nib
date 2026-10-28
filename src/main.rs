@@ -29,10 +29,16 @@ fn main() -> ExitCode {
     // The guard lives inside `run`, so the terminal is restored before we print.
     let result = App::open_with(path, line, Recovery::system()).and_then(|app| {
         let mut app = app.with_clipboard(clipboard::detect());
-        app.run()
+        app.run()?;
+        Ok(app.exit_note().map(str::to_string))
     });
     match result {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(note) => {
+            if let Some(note) = note {
+                eprintln!("nib: {note}");
+            }
+            ExitCode::SUCCESS
+        }
         Err(err) => {
             eprintln!("nib: {err:#}");
             ExitCode::FAILURE

@@ -103,7 +103,6 @@ impl App {
                         "already open in another nib (pid {pid}) \u{2014} open read-only? (Y/n)"
                     ),
                     keys: &['y', 'n'],
-                    // The only choice where Enter means yes.
                     default: Some('y'),
                 };
                 self.ask(p, FileFlow::ReadOnly(pending));
@@ -115,7 +114,8 @@ impl App {
                         fileio::format_mtime(when)
                     ),
                     keys: &['y', 'n'],
-                    default: None,
+                    // Safe: the text loads as unsaved and the file is untouched.
+                    default: Some('y'),
                 };
                 self.ask(p, FileFlow::Recover(pending));
             }
@@ -134,7 +134,7 @@ impl App {
         line: Option<usize>,
         shared: bool,
     ) {
-        self.recovery.attach(&path, shared);
+        let shared = self.recovery.attach(&path, shared);
         self.editor = Editor::new(buf);
         self.set_indent(indent::detect_indent(
             &self.editor.buf.rope,
@@ -219,9 +219,9 @@ impl App {
         }
         self.editor.buf.dirty = false;
         self.editor.mark_saved();
-        self.recovery.saved(&path);
+        let shared = self.recovery.saved(&path);
         self.disk_mtime = fileio::mtime(&path);
-        self.read_only = !fileio::is_writable(&path);
+        self.read_only = shared || !fileio::is_writable(&path);
         self.is_new = false;
         self.path = Some(path);
         true
@@ -311,7 +311,7 @@ impl App {
                     }
                 }
             }
-            // N to read-only, and Enter or Esc to either, cancel the open.
+            // N to read-only, and Esc to either, cancel the open.
             (FileFlow::ReadOnly(o) | FileFlow::Recover(o), _) => self.cancel_open(o.startup),
             _ => {}
         }
@@ -332,6 +332,7 @@ impl App {
     /// so nib leaves.
     fn cancel_open(&mut self, startup: bool) {
         if startup {
+            self.exit_note = self.status.take().map(|(s, _)| s);
             self.quit = true;
         }
     }
@@ -351,6 +352,12 @@ impl App {
         let no_name = name.ends_with(['/', '\\']) || Path::new(name).file_name().is_none();
         if no_name || path.is_dir() {
             self.set_status("Not a file name");
+            return;
+        }
+        // Two nibs writing one file is what the lock is there to prevent.
+        if let Check::Owned(pid) = self.recovery.check(&path) {
+            let name = file_name(&path);
+            self.set_status(&format!("{name} is open in another nib (pid {pid})"));
             return;
         }
         // Saving over the buffer's own file is just a save.
