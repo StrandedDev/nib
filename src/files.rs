@@ -14,6 +14,7 @@ use crate::fileio::{self, Loaded};
 use crate::indent;
 use crate::layout::Row;
 use crate::prompt::{Prompt, PromptResult};
+use crate::recovery::{Check, Recovery};
 
 pub(crate) const SAVE_CHOICE: &str = "Save? (Y)es / (N)o / (C)ancel";
 
@@ -32,6 +33,19 @@ pub(crate) enum FileFlow {
         then: Then,
     },
     OpenName,
+    /// `already open in another nib …? (Y/n)`
+    ReadOnly(PendingOpen),
+    /// `Recover unsaved changes from …? (Y/n)`
+    Recover(PendingOpen),
+}
+
+/// An open waiting on a recovery or lock question.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingOpen {
+    path: PathBuf,
+    line: Option<usize>,
+    /// Nothing to go back to: declining leaves nib.
+    startup: bool,
 }
 
 /// What follows a successful save.
@@ -46,19 +60,81 @@ impl App {
     /// Loads `path` (or starts an unnamed buffer) and puts the cursor on
     /// 1-based `line`, clamped. Never writes to disk.
     pub fn open(path: Option<PathBuf>, line: Option<usize>) -> Result<App> {
-        let Some(path) = path else {
-            return Ok(App::from_buffer(Buffer::new_empty(LineEnding::Lf), None));
-        };
-        let (buf, is_new) = read_for_edit(&path)?;
+        App::open_with(path, line, Recovery::disabled())
+    }
+
+    /// `open` with crash recovery and the lock kept in `recovery`. A file
+    /// with something to ask about opens once the prompt is answered.
+    pub fn open_with(
+        path: Option<PathBuf>,
+        line: Option<usize>,
+        recovery: Recovery,
+    ) -> Result<App> {
         let mut app = App::from_buffer(Buffer::new_empty(LineEnding::Lf), None);
-        app.replace_buffer(buf, is_new, path, line);
+        app.recovery = recovery;
+        if let Some(path) = path {
+            let (buf, is_new) = read_for_edit(&path)?;
+            app.open_checked(buf, is_new, path, line, true);
+        }
         Ok(app)
+    }
+
+    /// Opens `path`, unless another nib has it or a crash left changes for
+    /// it: then that is asked first.
+    fn open_checked(
+        &mut self,
+        buf: Buffer,
+        is_new: bool,
+        path: PathBuf,
+        line: Option<usize>,
+        startup: bool,
+    ) {
+        let check = self.recovery.check(&path);
+        let pending = PendingOpen {
+            path,
+            line,
+            startup,
+        };
+        match check {
+            Check::Clear => self.replace_buffer(buf, is_new, pending.path, line, false),
+            Check::Owned(pid) => {
+                let p = Prompt::Choice {
+                    label: format!(
+                        "already open in another nib (pid {pid}) \u{2014} open read-only? (Y/n)"
+                    ),
+                    keys: &['y', 'n'],
+                    // The only choice where Enter means yes.
+                    default: Some('y'),
+                };
+                self.ask(p, FileFlow::ReadOnly(pending));
+            }
+            Check::Stale(when) => {
+                let p = Prompt::Choice {
+                    label: format!(
+                        "Recover unsaved changes from {}? (Y/n)",
+                        fileio::format_mtime(when)
+                    ),
+                    keys: &['y', 'n'],
+                    default: None,
+                };
+                self.ask(p, FileFlow::Recover(pending));
+            }
+        }
     }
 
     /// Makes `buf` the buffer for `path`, resetting everything that belongs
     /// to the old one: undo history, cursor, indent, file state, scroll and
     /// any find session.
-    fn replace_buffer(&mut self, buf: Buffer, is_new: bool, path: PathBuf, line: Option<usize>) {
+    /// A `shared` buffer is a read-only copy of a file another nib owns.
+    fn replace_buffer(
+        &mut self,
+        buf: Buffer,
+        is_new: bool,
+        path: PathBuf,
+        line: Option<usize>,
+        shared: bool,
+    ) {
+        self.recovery.attach(&path, shared);
         self.editor = Editor::new(buf);
         self.set_indent(indent::detect_indent(
             &self.editor.buf.rope,
@@ -66,7 +142,7 @@ impl App {
         ));
         self.is_new = is_new;
         self.disk_mtime = fileio::mtime(&path);
-        self.read_only = !is_new && !fileio::is_writable(&path);
+        self.read_only = shared || (!is_new && !fileio::is_writable(&path));
         self.path = Some(path);
         self.find = None;
         self.last_click = None;
@@ -90,7 +166,7 @@ impl App {
         let (path, line) = cli::resolve(raw, |p| p.exists());
         let path = std::path::absolute(&path).unwrap_or(path);
         match read_for_edit(&path) {
-            Ok((buf, is_new)) => self.replace_buffer(buf, is_new, path, line),
+            Ok((buf, is_new)) => self.open_checked(buf, is_new, path, line, false),
             Err(e) => self.set_status(&format!("{e:#}")),
         }
     }
@@ -143,6 +219,7 @@ impl App {
         }
         self.editor.buf.dirty = false;
         self.editor.mark_saved();
+        self.recovery.saved(&path);
         self.disk_mtime = fileio::mtime(&path);
         self.read_only = !fileio::is_writable(&path);
         self.is_new = false;
@@ -176,7 +253,10 @@ impl App {
     fn proceed(&mut self, then: Then) {
         match then {
             Then::Stay => {}
-            Then::Quit => self.quit = true,
+            Then::Quit => {
+                self.recovery.close();
+                self.quit = true;
+            }
             Then::Open => self.ask(Prompt::text("Open: "), FileFlow::OpenName),
         }
     }
@@ -198,7 +278,61 @@ impl App {
             }
             (FileFlow::SaveChoice { then }, PromptResult::Choice('n')) => self.proceed(then),
             (FileFlow::OpenName, PromptResult::Submit(name)) => self.open_named(&name),
+            (FileFlow::ReadOnly(o), PromptResult::Choice('y')) => {
+                if let Some((buf, is_new)) = self.reread(&o.path) {
+                    self.replace_buffer(buf, is_new, o.path, o.line, true);
+                }
+            }
+            (FileFlow::Recover(o), PromptResult::Choice('y')) => {
+                let Some((disk, is_new)) = self.reread(&o.path) else {
+                    return;
+                };
+                match self.recovery.payload(&o.path) {
+                    Some(buf) => {
+                        self.replace_buffer(buf, is_new, o.path.clone(), o.line, false);
+                        self.editor.mark_unsaved();
+                        self.recovery.adopt(&o.path);
+                    }
+                    None => self.replace_buffer(disk, is_new, o.path, o.line, false),
+                }
+            }
+            (FileFlow::Recover(o), PromptResult::Choice('n')) => {
+                match self.recovery.decline(&o.path) {
+                    Ok(bak) => {
+                        if let Some((buf, is_new)) = self.reread(&o.path) {
+                            self.replace_buffer(buf, is_new, o.path, o.line, false);
+                        }
+                        self.set_status(&format!("Recovery kept at {}", bak.display()));
+                    }
+                    // Opening now would overwrite the recovery file.
+                    Err(e) => {
+                        self.set_status(&format!("Recovery file not moved: {e}"));
+                        self.cancel_open(o.startup);
+                    }
+                }
+            }
+            // N to read-only, and Enter or Esc to either, cancel the open.
+            (FileFlow::ReadOnly(o) | FileFlow::Recover(o), _) => self.cancel_open(o.startup),
             _ => {}
+        }
+    }
+
+    /// Loads a file again after a prompt; it may have changed meanwhile.
+    fn reread(&mut self, path: &Path) -> Option<(Buffer, bool)> {
+        match read_for_edit(path) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                self.set_status(&format!("{e:#}"));
+                None
+            }
+        }
+    }
+
+    /// A declined open keeps the current buffer; at startup there is none,
+    /// so nib leaves.
+    fn cancel_open(&mut self, startup: bool) {
+        if startup {
+            self.quit = true;
         }
     }
 

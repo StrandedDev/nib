@@ -109,6 +109,11 @@ impl UndoStack {
         self.saved = Some(self.applied);
     }
 
+    /// No state in the history matches the file on disk.
+    pub fn mark_unsaved(&mut self) {
+        self.saved = None;
+    }
+
     pub fn undo(&mut self, buf: &mut Buffer) -> Option<Pos> {
         if self.applied == 0 {
             return None;

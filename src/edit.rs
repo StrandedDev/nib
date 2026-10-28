@@ -43,6 +43,12 @@ impl Editor {
         self.undo.mark_saved();
     }
 
+    /// The text differs from the file and no undo gets back to it.
+    pub fn mark_unsaved(&mut self) {
+        self.undo.mark_unsaved();
+        self.buf.dirty = true;
+    }
+
     pub fn undo(&mut self) {
         let pos = self.undo.undo(&mut self.buf);
         self.settle(pos);

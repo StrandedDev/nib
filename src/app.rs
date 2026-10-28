@@ -22,6 +22,7 @@ use crate::keymap::Keymap;
 use crate::layout::{self, Viewport};
 use crate::palette::Palette;
 use crate::prompt::{Prompt, PromptResult};
+use crate::recovery::Recovery;
 use crate::render::{self, AppView, PaletteView};
 use crate::terminal::Guard;
 
@@ -47,6 +48,7 @@ pub struct App {
     pub(crate) clip: Box<dyn Clip>,
     pub(crate) quit: bool,
     pub(crate) line_numbers: bool,
+    pub(crate) recovery: Recovery,
 }
 
 /// What the open prompt is for.
@@ -79,6 +81,20 @@ impl App {
     /// The terminal loop. The only place that takes over the terminal; the
     /// guard restores it on every return.
     pub fn run(&mut self) -> Result<()> {
+        let r = self.run_loop();
+        if r.is_err() {
+            self.on_fatal_error();
+        }
+        r
+    }
+
+    /// Before an error ends nib: keep a dirty buffer in the recovery file.
+    /// Best effort; the error being reported matters more.
+    pub(crate) fn on_fatal_error(&mut self) {
+        let _ = self.recovery.flush(&self.editor.buf, self.path.as_deref());
+    }
+
+    fn run_loop(&mut self) -> Result<()> {
         let _guard = Guard::enter()?;
         let (w, h) = terminal::size()?;
         self.handle_event(Event::Resize(w, h));
@@ -100,10 +116,23 @@ impl App {
                 changed = !matches!(&ev, Event::Mouse(m) if m.kind == MouseEventKind::Moved);
                 self.handle_event(ev);
             }
-            redraw = self.expire_status(Instant::now()) || changed;
+            let now = Instant::now();
+            let ticked = self.tick(now);
+            redraw = self.expire_status(now) || changed || ticked;
         }
         out.flush()?;
         Ok(())
+    }
+
+    /// Timed work for the loop: the recovery file. Returns whether the
+    /// status line changed.
+    pub(crate) fn tick(&mut self, now: Instant) -> bool {
+        let msg = self
+            .recovery
+            .tick(now, &self.editor.buf, self.path.as_deref());
+        let changed = msg.is_some();
+        self.status_from(msg);
+        changed
     }
 
     fn view(&self) -> AppView<'_> {
@@ -501,6 +530,7 @@ impl App {
             clip: Box::new(Osc52::default()),
             quit: false,
             line_numbers: false,
+            recovery: Recovery::disabled(),
         }
     }
 }

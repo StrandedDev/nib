@@ -118,6 +118,14 @@ so Ctrl+S / Ctrl+Q reach nib.
   Symlinks are followed (the real file is replaced, the link stays); mode and owner are preserved.
 - **Recovery file:** written every few seconds while dirty; offered on next open after a crash.
   It records the owning PID; a second nib on the same file offers read-only, or recovery if that PID is gone.
+  - Location: `%LOCALAPPDATA%\nib\recovery\` (Windows), `~/.local/share/nib/recovery/` (Linux), created when first needed. A named file uses `<hash>.rec`, where the hash is FNV-1a 64 of the absolute path's bytes as 16 lowercase hex digits (not canonicalised: new files do not exist yet). An unnamed buffer uses `untitled-<pid>.rec`.
+  - Format: `nib-recovery 1`, `pid <n>`, `path <path>`, an empty line, then the exact bytes a save would write. A file that does not parse (or whose text is not UTF-8) counts as no recovery and is never deleted.
+  - Written through the atomic save path while dirty, at most every 3 s and only when the text changed since the last write. A failed write says `Recovery file not written: <error>` once (again only after a write has worked) and editing goes on.
+  - Deleted after a successful save, on quit, when undo returns to the saved state, and when Open replaces the buffer (after it was saved or the user chose not to). Kept after a failed save. If nib is about to exit on a terminal error with a dirty buffer, it writes the file first.
+  - Lock: while a named file is open, nib keeps `<hash>.lock` (same header, no text) in the recovery directory; it goes on quit and on Open-away. A `.lock` or `.rec` whose PID is running and is not this nib's means the file is open elsewhere. PID check: `/proc/<pid>` on Linux, `tasklist` on Windows; other systems count every PID as gone.
+  - On open (startup and Open): if another nib has the file, `already open in another nib (pid N) — open read-only? (Y/n)`; Enter or Y opens it read-only (`[Read-only]`, Save refused, Save As works); this nib takes no lock and writes no recovery for it, but does for a Save As target. N or Esc cancels the open: at startup nib exits (code 0), on Open the current buffer stays. This is the only choice where Enter means yes.
+  - Otherwise, if a recovery file is left from a nib that is gone: `Recover unsaved changes from YYYY-MM-DD HH:MM? (Y/n)` (the recovery file's time). Y loads its text as a modified buffer for the same path; the file on disk is untouched until a save, and undo cannot reach a state that counts as saved. N moves it to `<hash>.rec.bak` (replacing an older one), opens the file from disk and says `Recovery kept at <path>`. Enter or Esc cancels the open, as above.
+  - Unnamed buffers are never offered at startup (there is no path to match); their `untitled-<pid>.rec` files stay on disk after a crash for manual recovery.
 - **External change:** detected before save; user is warned.
 - **Panic:** a panic hook restores the terminal (raw mode off, main screen back) before exit.
 
@@ -128,7 +136,7 @@ so Ctrl+S / Ctrl+Q reach nib.
 | Binary or non-UTF-8 file | Message screen; exit on Enter / Space / Esc. File untouched. |
 | Path is a directory | Same as above. |
 | File > 50 MB | `File is 2.1 GB — open anyway? (y/N)` |
-| Already open in another nib | `already open in another nib (pid N) — open read-only? (Y/n)` |
+| Already open in another nib | `already open in another nib (pid N) — open read-only? (Y/n)`; see Recovery file above. |
 | No write permission | `[Read-only]` in title; editing allowed; save fails with message; Save As works. No built-in sudo. |
 | Disk full / write error | Original untouched; error shown; buffer and recovery file kept. |
 | File deleted while open | Save recreates it. |

@@ -13,6 +13,7 @@ pub mod keymap;
 pub mod layout;
 pub mod palette;
 pub mod prompt;
+pub mod recovery;
 pub mod render;
 pub mod terminal;
 pub mod undo;
