@@ -12,6 +12,8 @@ pub enum Prompt {
     Choice {
         label: String,
         keys: &'static [char],
+        /// What Enter picks; `None` makes Enter cancel, like Esc.
+        default: Option<char>,
     },
 }
 
@@ -32,7 +34,7 @@ impl Prompt {
             return PromptResult::Cancel;
         }
         match self {
-            Prompt::Choice { keys, .. } => match key.code {
+            Prompt::Choice { keys, default, .. } => match key.code {
                 // Ctrl+A and the like are shortcuts, not answers.
                 KeyCode::Char(_)
                     if key
@@ -49,8 +51,8 @@ impl Prompt {
                         PromptResult::Pending
                     }
                 }
-                // Enter takes the safe default, same as Esc.
-                KeyCode::Enter => PromptResult::Cancel,
+                // Enter takes the safe default, which is Esc unless set.
+                KeyCode::Enter => default.map_or(PromptResult::Cancel, PromptResult::Choice),
                 _ => PromptResult::Pending,
             },
             Prompt::Text { input, cursor, .. } => edit_text(input, cursor, key),
@@ -131,6 +133,7 @@ mod tests {
         let mut p = Prompt::Choice {
             label: "Save?".into(),
             keys: &['y', 'n', 'c'],
+            default: None,
         };
         assert_eq!(
             p.handle_key(&key(KeyCode::Char('Y'))),
@@ -181,12 +184,27 @@ mod tests {
     }
 
     #[test]
-    fn choice_enter_cancels() {
+    fn other_choices_enter_still_cancels() {
         let mut p = Prompt::Choice {
             label: "Replace?".into(),
             keys: &['y', 'n'],
+            default: None,
         };
         assert_eq!(p.handle_key(&key(KeyCode::Enter)), PromptResult::Cancel);
+    }
+
+    #[test]
+    fn choice_default_taken_on_enter() {
+        let mut p = Prompt::Choice {
+            label: "Open read-only? (Y/n)".into(),
+            keys: &['y', 'n'],
+            default: Some('y'),
+        };
+        assert_eq!(
+            p.handle_key(&key(KeyCode::Enter)),
+            PromptResult::Choice('y')
+        );
+        assert_eq!(p.handle_key(&key(KeyCode::Esc)), PromptResult::Cancel);
     }
 
     #[test]
@@ -194,6 +212,7 @@ mod tests {
         let mut p = Prompt::Choice {
             label: "Replace?".into(),
             keys: &['a', 'r'],
+            default: None,
         };
         let ctrl_a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL);
         let alt_r = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT);

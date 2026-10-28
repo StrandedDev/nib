@@ -348,6 +348,7 @@ impl FindSession {
                 self.prompt = Prompt::Choice {
                     label: "Replace? (R)eplace / (A)ll / (S)kip / Esc".into(),
                     keys: &['r', 'a', 's'],
+                    default: None,
                 };
                 (self.limit, self.wrapped) = (self.start, false);
                 if find_next(&ed.buf.rope, &self.query, self.start, true, true).is_none() {

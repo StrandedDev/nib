@@ -165,6 +165,7 @@ impl App {
             let p = Prompt::Choice {
                 label: SAVE_CHOICE.to_string(),
                 keys: &['y', 'n', 'c'],
+                default: None,
             };
             self.ask(p, FileFlow::SaveChoice { then });
         } else {
@@ -223,6 +224,7 @@ impl App {
             let p = Prompt::Choice {
                 label: format!("{} exists. Replace? (y/N)", file_name(&path)),
                 keys: &['y', 'n'],
+                default: None,
             };
             self.ask(p, FileFlow::ConfirmReplace { path, then });
         } else {
@@ -280,7 +282,7 @@ mod tests {
         assert!(!app.quit);
         match &app.prompt {
             Some((
-                Prompt::Choice { label, keys },
+                Prompt::Choice { label, keys, .. },
                 PromptPurpose::File(FileFlow::SaveChoice { then: Then::Quit }),
             )) => {
                 assert_eq!(label, "Save? (Y)es / (N)o / (C)ancel");
@@ -474,7 +476,7 @@ mod tests {
         app.dispatch(CommandId::Save);
         submit_name(&mut app, &p);
         match &app.prompt {
-            Some((Prompt::Choice { label, keys }, _)) => {
+            Some((Prompt::Choice { label, keys, .. }, _)) => {
                 assert_eq!(label, "old.txt exists. Replace? (y/N)");
                 assert_eq!(*keys, &['y', 'n']);
             }
