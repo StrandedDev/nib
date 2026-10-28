@@ -42,6 +42,7 @@ pub struct App {
     pub(crate) last_click: Option<(Instant, u16, u16)>,
     pub(crate) clip: Box<dyn Clip>,
     pub(crate) quit: bool,
+    pub(crate) line_numbers: bool,
 }
 
 /// What the open prompt is for.
@@ -106,6 +107,7 @@ impl App {
             editor: &self.editor,
             viewport: &self.viewport,
             screen: self.screen,
+            gutter: self.gutter(),
             name: self
                 .path
                 .as_deref()
@@ -186,8 +188,50 @@ impl App {
             }
             C::Open => self.ask_open(),
             C::SaveAs => self.save_as(),
+            C::ToggleLineNumbers => {
+                self.line_numbers = !self.line_numbers;
+                self.fit_width();
+            }
+            C::ToggleWrap => {
+                self.viewport.wrap = !self.viewport.wrap;
+                self.relayout();
+            }
             C::GotoLine => self.prompt = Some((Prompt::text("Line: "), PromptPurpose::GotoLine)),
             _ => self.set_status("Not available yet"),
+        }
+    }
+
+    /// After a change of text width or wrap mode. Old row starts and the
+    /// no-wrap anchor mean nothing now; the line start always is a row
+    /// start, and scrolling to the cursor finds the rest.
+    fn relayout(&mut self) {
+        let vp = &mut self.viewport;
+        vp.invalidate();
+        vp.top = layout::Row {
+            line: vp.top.line,
+            start_col: 0,
+            end_col: 0,
+        };
+        let e = &self.editor;
+        layout::scroll_to_cursor(&e.buf.rope, vp, e.cursor, e.buf.version);
+    }
+
+    /// Columns taken by line numbers: digits of the last line number and a
+    /// space, or none when they are off.
+    pub(crate) fn gutter(&self) -> u16 {
+        if self.line_numbers {
+            render::gutter_width(self.editor.buf.rope.len_lines()).min(self.screen.0)
+        } else {
+            0
+        }
+    }
+
+    /// Gives the text area what the gutter leaves. Cheap when nothing changed.
+    fn fit_width(&mut self) {
+        let w = self.screen.0.saturating_sub(self.gutter());
+        if self.viewport.width != w {
+            self.viewport.width = w;
+            self.relayout();
         }
     }
 
@@ -334,16 +378,9 @@ impl App {
             }
             Event::Resize(w, h) => {
                 self.screen = (w, h);
-                let vp = &mut self.viewport;
-                (vp.width, vp.height) = (w, h.saturating_sub(2));
-                vp.invalidate();
-                // Old row starts mean nothing at a new width; the line start
-                // always is a row start, and the scroll below finds the cursor.
-                vp.top = layout::Row {
-                    line: vp.top.line,
-                    start_col: 0,
-                    end_col: 0,
-                };
+                self.viewport.height = h.saturating_sub(2);
+                self.viewport.width = w.saturating_sub(self.gutter());
+                self.relayout();
             }
             Event::Paste(s) => match (&mut self.find, &mut self.prompt) {
                 (Some(f), _) => {
@@ -359,6 +396,8 @@ impl App {
             }
             _ => {}
         }
+        // Each frame: an edit may have changed the line count's digits.
+        self.fit_width();
         let e = &self.editor;
         layout::scroll_to_cursor(&e.buf.rope, &mut self.viewport, e.cursor, e.buf.version);
     }
@@ -371,13 +410,15 @@ impl App {
         // The text area sits between the title row and the status row.
         let text_row =
             |m: &MouseEvent| (m.row >= 1 && m.row <= self.viewport.height).then(|| m.row - 1);
+        // A click in the gutter lands at the start of its row.
+        let x = m.column.saturating_sub(self.gutter());
         let (rope, vp) = (&self.editor.buf.rope, &self.viewport);
         match m.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 let Some(y) = text_row(&m) else {
                     return;
                 };
-                let p = layout::screen_to_pos(rope, vp, m.column, y);
+                let p = layout::screen_to_pos(rope, vp, x, y);
                 let prev = self.last_click.take();
                 let double = prev.is_some_and(|(t, x, y0)| {
                     (x, y0) == (m.column, m.row) && now.saturating_duration_since(t) < DOUBLE_CLICK
@@ -393,7 +434,7 @@ impl App {
                 let Some(y) = text_row(&m) else {
                     return;
                 };
-                let p = layout::screen_to_pos(rope, vp, m.column, y);
+                let p = layout::screen_to_pos(rope, vp, x, y);
                 self.editor.move_to(p, true);
             }
             MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
@@ -428,6 +469,7 @@ impl App {
             last_click: None,
             clip: Box::new(Osc52::default()),
             quit: false,
+            line_numbers: false,
         }
     }
 }
@@ -1014,9 +1056,7 @@ three"
 
     #[test]
     fn goto_clamps() {
-        let mut app = doc("a
-bb
-c");
+        let mut app = doc("a\nbb\nc");
         app.handle_event(ctrl('g'));
         match &app.prompt {
             Some((Prompt::Text { label, .. }, _)) => assert_eq!(label, "Line: "),
@@ -1037,9 +1077,7 @@ c");
     #[test]
     fn goto_bad_input_message() {
         for input in ["", "  ", "abc", "-1", "2x", "1.5"] {
-            let mut app = doc("a
-bb
-c");
+            let mut app = doc("a\nbb\nc");
             app.editor.move_to(pos(1, 1), false);
             goto(&mut app, input);
             assert_eq!(status(&app), "Not a line number", "{input:?}");
@@ -1049,11 +1087,73 @@ c");
 
     #[test]
     fn goto_zero_goes_to_first_line() {
-        let mut app = doc("a
-bb
-c");
+        let mut app = doc("a\nbb\nc");
         app.editor.move_to(pos(2, 1), false);
         goto(&mut app, "0");
         assert_eq!(app.editor.cursor, pos(0, 0));
+    }
+
+    #[test]
+    fn toggle_wrap_flips() {
+        let mut app = doc(&format!("{}\nb", "a".repeat(30)));
+        app.handle_event(Event::Resize(10, 4));
+        app.dispatch(CommandId::End);
+        app.handle_event(Event::Resize(10, 4));
+        assert_eq!(app.viewport.top.start_col, 20);
+        app.dispatch(CommandId::ToggleWrap);
+        let vp = &app.viewport;
+        assert!(!vp.wrap);
+        assert_eq!(vp.top.start_col, 0);
+        assert!(vp.hscroll > 0);
+        assert_eq!(cursor_cell(&app), Some((9, 0)));
+        app.dispatch(CommandId::ToggleWrap);
+        let vp = &app.viewport;
+        assert!(vp.wrap);
+        assert_eq!((vp.hscroll, vp.hscroll_col), (0, 0));
+        assert_eq!(vp.top.start_col % 10, 0, "{:?}", vp.top);
+        assert!(cursor_cell(&app).is_some());
+    }
+
+    #[test]
+    fn line_numbers_gutter_width() {
+        let mut app = doc("1\n2\n3\n4\n5\n6\n7\n8\n9");
+        app.handle_event(Event::Resize(20, 10));
+        assert_eq!((app.gutter(), app.viewport.width), (0, 20));
+        app.dispatch(CommandId::ToggleLineNumbers);
+        assert_eq!((app.gutter(), app.viewport.width), (2, 18));
+        // Line 10 needs another digit.
+        app.handle_event(key(KeyCode::End, KeyModifiers::CONTROL));
+        app.handle_event(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!((app.gutter(), app.viewport.width), (3, 17));
+        app.dispatch(CommandId::Undo);
+        app.handle_event(key(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!((app.gutter(), app.viewport.width), (2, 18));
+        app.dispatch(CommandId::ToggleLineNumbers);
+        assert_eq!((app.gutter(), app.viewport.width), (0, 20));
+    }
+
+    #[test]
+    fn click_with_gutter_maps_correctly() {
+        let mut text = "a".repeat(30);
+        for i in 1..10 {
+            text.push_str(&format!("\nl{i}"));
+        }
+        let mut app = doc(&text);
+        app.handle_event(Event::Resize(20, 10));
+        app.dispatch(CommandId::ToggleLineNumbers);
+        assert_eq!((app.gutter(), app.viewport.width), (3, 17));
+        let t = Instant::now();
+        app.handle_mouse_at(down(5, 1), t);
+        assert_eq!(app.editor.cursor, pos(0, 2));
+        // The second row of the wrapped first line starts at col 17.
+        app.handle_mouse_at(down(5, 2), t + Duration::from_secs(1));
+        assert_eq!(app.editor.cursor, pos(0, 19));
+        // Gutter clicks land on the start of the row.
+        app.handle_mouse_at(down(1, 2), t + Duration::from_secs(2));
+        assert_eq!(app.editor.cursor, pos(0, 17));
+        app.handle_mouse_at(down(0, 3), t + Duration::from_secs(3));
+        assert_eq!(app.editor.cursor, pos(1, 0));
+        app.handle_mouse_at(drag(4, 3), t + Duration::from_secs(3));
+        assert_eq!(app.editor.selection(), Some(31..32));
     }
 }

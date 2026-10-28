@@ -31,6 +31,10 @@ regex search · multiple buffers/tabs · block selection · multiple cursors · 
   - `New File` for a buffer never saved.
   - `[Read-only]` is appended when the file is not writable.
 - **Text area:** soft wrap on by default; line numbers off by default. Both toggle via palette and config.
+  Line numbers sit in a gutter as wide as the last line number's digits plus one space, drawn
+  right-aligned in dark grey on the first row of each line (wrapped continuation rows get a blank
+  gutter); the text gets the rest of the width. A click in the gutter puts the cursor at the start
+  of that row. Turning wrap on or off keeps the cursor on screen.
 - **Status line:** empty by default; transient messages fade after a few seconds; prompts appear here.
 - **No shortcut bar.** The command palette replaces it.
 - **Colours:** the terminal's 16 ANSI colours only, so nib follows the terminal theme.

@@ -380,8 +380,18 @@ fn row_holds(rope: &Rope, vp: &Viewport, row: &Row, cur: Pos) -> bool {
 /// First grapheme boundary of the line at display x >= `target` (or the line
 /// end), as (col, x). Bulk-skips ASCII so one walk over a huge line is cheap.
 fn boundary_at_or_after(s: RopeSlice, target: usize, tab: u8) -> (usize, usize) {
+    boundary_from(s, 0, 0, target, tab)
+}
+
+/// As `boundary_at_or_after`, walking from `col`, which sits at display x `x`.
+fn boundary_from(
+    s: RopeSlice,
+    mut col: usize,
+    mut x: usize,
+    target: usize,
+    tab: u8,
+) -> (usize, usize) {
     let len = s.len_chars();
-    let (mut col, mut x) = (0, 0);
     while col < len && x < target {
         if let Some(n) = ascii_run(s, col) {
             let k = n.min(target - x);
@@ -486,7 +496,15 @@ pub(crate) fn draw_cells<'a>(
     let left = if vp.wrap { 0 } else { vp.hscroll };
     let right = left + usize::from(vp.width);
     let end_col = row.end_col;
-    row_cells(s, vp, row, left)
+    let cells = if vp.wrap || anchored(s, vp, row.line, left) {
+        row_cells(s, vp, row, left)
+    } else {
+        // Skip to the left edge in bulk; a grapheme cut by it is left out
+        // below anyway.
+        let (col, x) = boundary_at_or_after(s, left, vp.tab_width);
+        Cells::at(s, col, x, vp.tab_width)
+    };
+    cells
         .take_while(move |c| c.start < end_col && c.x + c.w <= right)
         .filter(move |c| c.x >= left)
         .map(move |c| DrawCell {
@@ -779,10 +797,8 @@ fn scroll_nowrap(rope: &Rope, vp: &mut Viewport, cur: Pos, height: usize, versio
         (vp.hscroll_col, vp.hscroll) = (cur.col, x);
     } else if x >= vp.hscroll + width {
         let want = x + 1 - width;
-        let (col, x) = Cells::at(s, vp.hscroll_col, vp.hscroll, tab)
-            .find(|c| c.x >= want)
-            .map_or((cur.col, x), |c| (c.start, c.x));
-        (vp.hscroll_col, vp.hscroll) = (col, x);
+        // x >= want somewhere at or before the cursor, so this stops there.
+        (vp.hscroll_col, vp.hscroll) = boundary_from(s, vp.hscroll_col, vp.hscroll, want, tab);
     }
 }
 
@@ -1346,5 +1362,38 @@ mod tests {
         assert_eq!(cursor_screen(&r, &v, pos(4, 1)), None);
         assert_eq!(cursor_screen(&r, &v, pos(4, 8)), None);
         assert_eq!(cursor_screen(&r, &v, pos(4, 5)), Some((2, 4)));
+    }
+
+    #[test]
+    fn nowrap_far_jump_from_line_start_is_fast() {
+        // Wrap just turned off, or End on a huge line: the anchor is far behind.
+        let r = long_line_rope();
+        let mut v = vp(80, 24, false);
+        let cur = pos(0, 2_500_000);
+        let start = std::time::Instant::now();
+        scroll_to_cursor(&r, &mut v, cur, 0);
+        let elapsed = start.elapsed();
+        assert_eq!(cursor_screen(&r, &v, cur), Some((79, 0)));
+        assert!(elapsed.as_millis() < 50, "{elapsed:?}");
+    }
+
+    #[test]
+    fn nowrap_draw_cells_off_anchor_match_full_walk() {
+        let text = "ab\tc\u{4f60}\u{597d}e\u{301}xyz\r\u{1F468}\u{200D}\u{1F469}w\tq0123456789";
+        let r = Rope::from_str(&format!("{text}\n{text}"));
+        for left in 0..30 {
+            let mut v = vp(6, 5, false);
+            // The anchor is on the other line, so line 0 walks from its start.
+            (v.hscroll, v.hscroll_line, v.hscroll_col) = (left, 1, 0);
+            let got: Vec<_> = draw_cells(&r, &v, &row(0, 0, text.chars().count()))
+                .map(|c| (c.start, c.x, c.w))
+                .collect();
+            let want: Vec<_> = Cells::new(line_text(&r, 0), 0, 4)
+                .take_while(|c| c.x + c.w <= left + 6)
+                .filter(|c| c.x >= left)
+                .map(|c| (c.start, c.x - left, c.w))
+                .collect();
+            assert_eq!(got, want, "left {left}");
+        }
     }
 }

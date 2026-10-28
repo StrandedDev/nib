@@ -3,7 +3,6 @@
 
 use std::fmt;
 use std::io::{self, Write};
-use std::ops::Range;
 
 use crossterm::{
     Command,
@@ -40,12 +39,21 @@ impl Command for MarkColour {
     }
 }
 
+/// Gutter width for `lines` lines: the digits of the last line number and
+/// one space.
+pub fn gutter_width(lines: usize) -> u16 {
+    let digits = lines.max(1).ilog10() + 1;
+    u16::try_from(digits).unwrap_or(u16::MAX) + 1
+}
+
 /// What one frame needs, borrowed from `App`.
 pub struct AppView<'a> {
     pub editor: &'a Editor,
     pub viewport: &'a Viewport,
     /// Terminal size; the text area is `height - 2` rows.
     pub screen: (u16, u16),
+    /// Columns of line numbers left of the text; 0 when off.
+    pub gutter: u16,
     pub name: String,
     pub state: String,
     pub status: Option<&'a str>,
@@ -72,18 +80,10 @@ pub fn draw(out: &mut impl Write, app: &AppView) -> io::Result<()> {
     let text_h = h.saturating_sub(2);
     let rope = &app.editor.buf.rope;
     let rows = layout::visible_rows(rope, app.viewport);
-    let marks = match (app.find, rows.first(), rows.last()) {
-        (Some(f), Some(a), Some(b)) => {
-            let seen =
-                rope.line_to_char(a.line) + a.start_col..rope.line_to_char(b.line) + b.end_col;
-            f.visible_matches(rope, seen)
-        }
-        _ => Vec::new(),
-    };
     for y in 0..text_h {
         queue!(out, MoveTo(0, y + 1))?;
         let used = match rows.get(usize::from(y)) {
-            Some(row) => draw_row(out, app, row, &marks)?,
+            Some(row) => draw_gutter(out, row, app.gutter)? + draw_row(out, app, row)?,
             None => 0,
         };
         if used < usize::from(w) {
@@ -98,7 +98,7 @@ pub fn draw(out: &mut impl Write, app: &AppView) -> io::Result<()> {
     if cursor.is_none() && text_h > 0 {
         if let Some((x, y)) = layout::cursor_screen(rope, app.viewport, app.editor.cursor) {
             if y < text_h {
-                cursor = Some((x.min(w - 1), y + 1));
+                cursor = Some((x.saturating_add(app.gutter).min(w - 1), y + 1));
             }
         }
     }
@@ -106,6 +106,27 @@ pub fn draw(out: &mut impl Write, app: &AppView) -> io::Result<()> {
         queue!(out, MoveTo(x, y), Show)?;
     }
     out.flush()
+}
+
+/// Draws the line number of `row` right-aligned in `width` columns, or a
+/// blank gutter on a wrapped continuation row. Returns the cells written.
+fn draw_gutter(out: &mut impl Write, row: &Row, width: u16) -> io::Result<usize> {
+    let width = usize::from(width);
+    if width == 0 {
+        return Ok(0);
+    }
+    if row.start_col == 0 {
+        let n = format!("{:>w$} ", row.line + 1, w = width - 1);
+        queue!(
+            out,
+            MarkColour,
+            Print(fit_right(&n, width)),
+            SetForegroundColor(Color::Reset)
+        )?;
+    } else {
+        queue!(out, Print(" ".repeat(width)))?;
+    }
+    Ok(width)
 }
 
 /// Switches an attribute on or off, writing only on a change.
@@ -128,12 +149,7 @@ const UNDERLINE: (Attribute, Attribute) = (Attribute::Underlined, Attribute::NoU
 /// Draws one text row from the cursor's current position. Returns the
 /// number of cells written. Selected cells, and the line end when its
 /// newline is selected, are drawn in reverse video.
-fn draw_row(
-    out: &mut impl Write,
-    app: &AppView,
-    row: &Row,
-    marks: &[Range<usize>],
-) -> io::Result<usize> {
+fn draw_row(out: &mut impl Write, app: &AppView, row: &Row) -> io::Result<usize> {
     let rope = &app.editor.buf.rope;
     let s = line_text(rope, row.line);
     let sel = app
@@ -148,6 +164,13 @@ fn draw_row(
         sel.is_some_and(|(a, b)| a <= p && p < b)
     };
     let base = rope.line_to_char(row.line);
+    let cells: Vec<_> = layout::draw_cells(rope, app.viewport, row).collect();
+    // Matches are looked for only under the cells on screen, so a huge
+    // no-wrap line costs one screen width, not its length.
+    let marks = match (app.find, cells.first(), cells.last()) {
+        (Some(f), Some(a), Some(b)) => f.visible_matches(rope, base + a.start..base + b.end),
+        _ => Vec::new(),
+    };
     // `marks` are sorted and do not overlap.
     let marked = |col: usize| {
         let i = base + col;
@@ -156,7 +179,7 @@ fn draw_row(
     };
     let (mut rev, mut under) = (false, false);
     let mut x = 0;
-    for c in layout::draw_cells(rope, app.viewport, row) {
+    for c in cells {
         if c.x > x {
             set_attr(out, &mut rev, false, REVERSE)?;
             set_attr(out, &mut under, false, UNDERLINE)?;
@@ -351,6 +374,7 @@ mod tests {
             editor: &e,
             viewport: &vp,
             screen: (width, 8),
+            gutter: 0,
             name: String::new(),
             state: String::new(),
             status: None,
@@ -403,6 +427,7 @@ mod tests {
             editor: &e,
             viewport: &vp,
             screen: (20, 8),
+            gutter: 0,
             name: String::new(),
             state: String::new(),
             status: None,
@@ -415,5 +440,72 @@ mod tests {
         // The current match is selected and underlined; the other only underlined.
         assert!(out.contains("\u{1b}[7m\u{1b}[4mab\u{1b}[27m"), "{out:?}");
         assert!(out.contains("\u{1b}[4mab\u{1b}[24m"), "{out:?}");
+    }
+
+    #[test]
+    fn line_numbers_drawn_in_gutter() {
+        let e = Editor::new(crate::buffer::Buffer::from_str_detect("abcdef\nx"));
+        // Text area of 4 columns after a 2-column gutter.
+        let vp = Viewport::new(4, 6, true, 4);
+        let view = AppView {
+            editor: &e,
+            viewport: &vp,
+            screen: (6, 8),
+            gutter: 2,
+            name: String::new(),
+            state: String::new(),
+            status: None,
+            prompt: None,
+            find: None,
+        };
+        let mut out = Vec::new();
+        draw(&mut out, &view).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        let num = |n: &str| format!("\u{1b}[90m{n}\u{1b}[39m");
+        assert!(out.contains(&format!("{}abcd", num("1 "))), "{out:?}");
+        // A wrapped continuation row has a blank gutter.
+        assert!(out.contains("\u{1b}[3;1H  ef"), "{out:?}");
+        assert!(out.contains(&format!("{}x", num("2 "))), "{out:?}");
+        // The cursor sits after the gutter.
+        assert!(out.ends_with("\u{1b}[2;3H\u{1b}[?25h"), "{out:?}");
+    }
+
+    #[test]
+    fn nowrap_render_highlight_is_bounded() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        // Two huge lines: the cursor's line carries the no-wrap anchor, the
+        // other one does not.
+        let line = "ab ".repeat(5 * 1024 * 1024 / 6);
+        let text = format!("{line}\n{line}");
+        let mut e = Editor::new(crate::buffer::Buffer::from_str_detect(&text));
+        e.move_to(pos(1, line.len() / 2), false);
+        let mut vp = Viewport::new(80, 6, false, 4);
+        layout::scroll_to_cursor(&e.buf.rope, &mut vp, e.cursor, e.buf.version);
+        let mut f = FindSession::new(&e, false);
+        for c in ['a', 'b'] {
+            let k = KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+            f.handle_key(&k, false, &mut e);
+        }
+        let view = AppView {
+            editor: &e,
+            viewport: &vp,
+            screen: (80, 8),
+            gutter: 0,
+            name: String::new(),
+            state: String::new(),
+            status: None,
+            prompt: Some(f.prompt()),
+            find: Some(&f),
+        };
+        let mut out = Vec::new();
+        let t = std::time::Instant::now();
+        draw(&mut out, &view).unwrap();
+        let took = t.elapsed();
+        let out = String::from_utf8(out).unwrap();
+        assert!(
+            out.contains("\u{1b}[4mab\u{1b}[24m"),
+            "matches still underlined"
+        );
+        assert!(took < std::time::Duration::from_millis(50), "{took:?}");
     }
 }
